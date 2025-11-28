@@ -1,0 +1,62 @@
+﻿namespace DistributedProcessor.Shared.Models
+{
+    public class DashboardState
+    {
+        public List<WorkerStatus> Workers { get; set; } = new();
+        public List<JobSummary> Jobs { get; set; } = new();
+        public List<TaskSummary> Tasks { get; set; } = new();
+        public CollectorStats CollectorStats { get; set; } = new();
+        public SystemMetrics SystemMetrics { get; set; } = new();
+    }
+
+    public class JobSummary
+    {
+        public string JobId { get; set; }
+        public string Fund { get; set; }
+        public DateTime SubmittedAt { get; set; }
+        public string Status { get; set; } // Pending, Processing, Completed, Failed
+        public int TotalTasks { get; set; }
+        public int CompletedTasks { get; set; }
+        public int PendingTasks { get; set; }
+        public int FailedTasks { get; set; }
+        public int TotalRows { get; set; }
+        public int ProcessedRows { get; set; }
+    }
+
+    public class TaskSummary
+    {
+        public string TaskId { get; set; }
+        public string JobId { get; set; }
+        public string Fund { get; set; }
+        public string Symbol { get; set; }
+        public string Status { get; set; } // Pending, Assigned, Processing, Completed, Failed
+        public string AssignedWorkerId { get; set; }
+        public int RowCount { get; set; }
+        public DateTime? StartedAt { get; set; }
+        public DateTime? CompletedAt { get; set; }
+    }
+
+    public class CollectorStats
+    {
+        public bool IsRunning { get; set; }
+        public int TotalResultsCollected { get; set; }
+        public int ResultsCollectedToday { get; set; }
+        public DateTime LastCollectionTime { get; set; }
+    }
+
+    public class SystemMetrics
+    {
+        public int TotalWorkers { get; set; }
+        public int ActiveWorkers { get; set; }
+        public int BusyWorkers { get; set; }
+        public int TotalJobs { get; set; }
+        public int ActiveJobs { get; set; }
+        public int TotalTasksCompleted { get; set; }
+    }
+
+    public class SymbolInfo
+    {
+        public string Fund { get; set; }
+        public string Symbol { get; set; }
+    }
+}

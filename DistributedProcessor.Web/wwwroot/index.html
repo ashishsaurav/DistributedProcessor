@@ -1,0 +1,778 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>Distributed Processor Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <style>
+        body {
+            background-color: #f5f5f5;
+        }
+
+        .metrics-card {
+            border-left: 4px solid #0d6efd;
+            transition: transform 0.2s;
+        }
+
+            .metrics-card:hover {
+                transform: translateY(-5px);
+            }
+
+        .worker-online {
+            background-color: #d1e7dd !important;
+        }
+
+        .worker-offline {
+            background-color: #f8d7da !important;
+        }
+
+        .worker-busy {
+            background-color: #fff3cd !important;
+        }
+
+        .log-entry {
+            font-size: 0.85rem;
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .status-badge {
+            font-size: 0.85rem;
+            padding: 0.35em 0.65em;
+        }
+
+        .card-header-custom {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .nav-tabs .nav-link.active {
+            background-color: #0d6efd;
+            color: white;
+        }
+
+        .progress-animated {
+            animation: progress-animation 1s ease-in-out;
+        }
+
+        @keyframes progress-animation {
+            from {
+                width: 0%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-dark">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0 h1">
+                <i class="bi bi-cpu-fill"></i> Distributed Processor Dashboard
+            </span>
+            <span id="connectionStatus" class="badge bg-success">Connected</span>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        <!-- System Metrics Row -->
+        <div class="row mb-4">
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-hdd-rack fs-2 text-primary"></i>
+                        <h6 class="mt-2">Total Workers</h6>
+                        <h2 id="totalWorkers">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-check-circle fs-2 text-success"></i>
+                        <h6 class="mt-2">Idle Workers</h6>
+                        <h2 id="idleWorkers">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-hourglass-split fs-2 text-warning"></i>
+                        <h6 class="mt-2">Busy Workers</h6>
+                        <h2 id="busyWorkers">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-briefcase fs-2 text-info"></i>
+                        <h6 class="mt-2">Total Jobs</h6>
+                        <h2 id="totalJobs">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-play-circle fs-2 text-primary"></i>
+                        <h6 class="mt-2">Active Jobs</h6>
+                        <h2 id="activeJobs">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-check-all fs-2 text-success"></i>
+                        <h6 class="mt-2">Active Tasks</h6>
+                        <h2 id="totalActiveTasks">0</h2>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Job Submission Card -->
+        <div class="card mb-4">
+            <div class="card-header card-header-custom">
+                <h5><i class="bi bi-plus-circle"></i> Submit New Job</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3">
+                        <label>Funds</label>
+                        <div class="btn-group btn-group-sm mb-2 w-100" role="group">
+                            <button type="button" class="btn btn-outline-primary btn-sm" onclick="selectAllFunds()">
+                                <i class="bi bi-check-all"></i> All
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="clearFundSelection()">
+                                <i class="bi bi-x"></i> Clear
+                            </button>
+                        </div>
+                        <select id="fundSelect" class="form-select" multiple size="5">
+                            <option disabled>Loading...</option>
+                        </select>
+                        <small class="text-muted">Selected: <strong id="selectedFundsDisplay">None</strong></small>
+                    </div>
+
+                    <div class="col-md-3">
+                        <label>Start Date</label>
+                        <input type="date" id="startDate" class="form-control">
+                    </div>
+
+                    <div class="col-md-3">
+                        <label>End Date</label>
+                        <input type="date" id="endDate" class="form-control">
+                    </div>
+
+                    <div class="col-md-3">
+                        <label>&nbsp;</label>
+                        <button onclick="submitJob()" class="btn btn-success w-100 btn-lg" id="submitBtn">
+                            <i class="bi bi-play-fill"></i> Submit Job
+                        </button>
+                    </div>
+                </div>
+                <div id="message" class="mt-3"></div>
+            </div>
+        </div>
+
+        <!-- Tabs for Workers, Jobs, Tasks -->
+        <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="workers-tab" data-bs-toggle="tab" data-bs-target="#workers" type="button">
+                    <i class="bi bi-hdd-rack"></i> Workers
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="jobs-tab" data-bs-toggle="tab" data-bs-target="#jobs" type="button">
+                    <i class="bi bi-briefcase"></i> Jobs
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="tasks-tab" data-bs-toggle="tab" data-bs-target="#tasks" type="button">
+                    <i class="bi bi-list-task"></i> Tasks
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs" type="button">
+                    <i class="bi bi-journal-text"></i> Event Log
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content" id="mainTabContent">
+            <!-- Workers Tab -->
+            <div class="tab-pane fade show active" id="workers" role="tabpanel">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Worker ID</th>
+                                        <th>Status</th>
+                                        <th>Active Tasks</th>
+                                        <th>CPU %</th>
+                                        <th>Memory (MB)</th>
+                                        <th>Last Heartbeat</th>
+                                        <th>Load Score</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="workersTableBody">
+                                    <tr><td colspan="7" class="text-center text-muted">Loading workers...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Jobs Tab -->
+            <div class="tab-pane fade" id="jobs" role="tabpanel">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Job ID</th>
+                                        <th>Fund(s)</th>
+                                        <th>Status</th>
+                                        <th>Progress</th>
+                                        <th>Completed/Total</th>
+                                        <th>Pending</th>
+                                        <th>Failed</th>
+                                        <th>Rows Processed</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="jobsTableBody">
+                                    <tr><td colspan="8" class="text-center text-muted">No jobs submitted yet</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tasks Tab -->
+            <div class="tab-pane fade" id="tasks" role="tabpanel">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-sm table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Task ID</th>
+                                        <th>Job ID</th>
+                                        <th>Fund/Symbol</th>
+                                        <th>Status</th>
+                                        <th>Worker</th>
+                                        <th>Rows</th>
+                                        <th>Started</th>
+                                        <th>Completed</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tasksTableBody">
+                                    <tr><td colspan="8" class="text-center text-muted">No tasks created yet</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Event Log Tab -->
+            <div class="tab-pane fade" id="logs" role="tabpanel">
+                <div class="card">
+                    <div class="card-body" style="max-height: 600px; overflow-y: auto;" id="logContainer">
+                        <p class="text-muted">Waiting for events...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/7.0.0/signalr.min.js"></script>
+    <script>
+        const API_URL = 'http://localhost:5000';
+        const workersMap = new Map();
+        let jobsData = [];
+        let tasksData = [];
+
+        // SignalR Connection
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl(`${API_URL}/hubs/monitoring`)
+            .withAutomaticReconnect()
+            .configureLogging(signalR.LogLevel.Information)
+            .build();
+
+        // Real-time event handlers
+        connection.on("JobsUpdate", function (jobs) {
+            console.log("JobsUpdate received:", jobs);
+            jobsData = jobs;
+            updateJobsTable();
+            updateMetrics();
+        });
+
+        connection.on("TasksUpdate", function (tasks) {
+            console.log("TasksUpdate received:", tasks);
+            tasksData = tasks;
+            updateTasksTable();
+        });
+
+        connection.on("WorkersUpdate", function (workers) {
+            console.log("WorkersUpdate received:", workers);
+            workers.forEach(w => workersMap.set(w.workerId, w));
+            updateWorkersTable();
+            updateMetrics();
+        });
+
+        // Start SignalR Connection
+        async function startConnection() {
+            try {
+                await connection.start();
+                console.log("SignalR Connected");
+                document.getElementById('connectionStatus').className = 'badge bg-success';
+                document.getElementById('connectionStatus').textContent = 'Connected';
+                addLog("Dashboard connected - Real-time updates active", "success");
+            } catch (err) {
+                console.error("SignalR Connection Error:", err);
+                document.getElementById('connectionStatus').className = 'badge bg-danger';
+                document.getElementById('connectionStatus').textContent = 'Disconnected';
+                addLog("Connection failed, retrying...", "warning");
+                setTimeout(startConnection, 5000);
+            }
+        }
+
+        connection.onreconnecting(() => {
+            document.getElementById('connectionStatus').className = 'badge bg-warning pulse';
+            document.getElementById('connectionStatus').textContent = 'Reconnecting...';
+            addLog("Reconnecting to dashboard...", "warning");
+        });
+
+        connection.onreconnected(() => {
+            document.getElementById('connectionStatus').className = 'badge bg-success';
+            document.getElementById('connectionStatus').textContent = 'Connected';
+            addLog("Reconnected to dashboard", "success");
+        });
+
+        connection.onclose(() => {
+            document.getElementById('connectionStatus').className = 'badge bg-danger';
+            document.getElementById('connectionStatus').textContent = 'Disconnected';
+            addLog("Disconnected from dashboard", "danger");
+            setTimeout(startConnection, 5000);
+        });
+
+        // Update Metrics
+        function updateMetrics() {
+            const workers = Array.from(workersMap.values());
+            const totalWorkers = workers.length;
+            const idleWorkers = workers.filter(w => w.state === 'Idle').length;
+            const busyWorkers = workers.filter(w => w.state === 'Busy').length;
+            const totalActiveTasks = workers.reduce((sum, w) => sum + (w.activeTasks || 0), 0);
+
+            document.getElementById('totalWorkers').textContent = totalWorkers;
+            document.getElementById('idleWorkers').textContent = idleWorkers;
+            document.getElementById('busyWorkers').textContent = busyWorkers;
+            document.getElementById('totalActiveTasks').textContent = totalActiveTasks;
+
+            const totalJobs = jobsData.length;
+            const activeJobs = jobsData.filter(j => j.status === 'Processing').length;
+
+            document.getElementById('totalJobs').textContent = totalJobs;
+            document.getElementById('activeJobs').textContent = activeJobs;
+        }
+
+        // Update Jobs Table
+        function updateJobsTable() {
+            const tbody = document.getElementById('jobsTableBody');
+            if (!tbody) return;
+
+            if (jobsData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No jobs submitted yet</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = jobsData.map(job => {
+                const progress = job.totalTasks > 0 ? Math.round((job.completedTasks / job.totalTasks) * 100) : 0;
+                const statusBadge = getStatusBadge(job.status);
+                const progressBar = getProgressBar(progress, job.status);
+
+                return `
+                        <tr>
+                            <td><code>${job.jobId.substring(0, 8)}</code></td>
+                            <td><strong>${job.fund}</strong></td>
+                            <td>${statusBadge}</td>
+                            <td>${progressBar}</td>
+                            <td>${job.completedTasks}/${job.totalTasks}</td>
+                            <td>${job.pendingTasks}</td>
+                            <td>${job.failedTasks}</td>
+                            <td>${job.processedRows.toLocaleString()}/${job.totalRows.toLocaleString()}</td>
+                        </tr>
+                    `;
+            }).join('');
+        }
+
+        // Update Tasks Table
+        function updateTasksTable() {
+            const tbody = document.getElementById('tasksTableBody');
+            if (!tbody) return;
+
+            if (tasksData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No tasks created yet</td></tr>';
+                return;
+            }
+
+            const recentTasks = tasksData.slice(0, 100);
+
+            tbody.innerHTML = recentTasks.map(task => {
+                const statusBadge = getTaskStatusBadge(task.status);
+
+                return `
+                        <tr>
+                            <td><code>${task.taskId.substring(0, 8)}</code></td>
+                            <td><code>${task.jobId.substring(0, 8)}</code></td>
+                            <td>${task.fund}/${task.symbol}</td>
+                            <td>${statusBadge}</td>
+                            <td><small>${task.workerId || '-'}</small></td>
+                            <td>${task.rowsProcessed || 0}</td>
+                            <td><small>${formatTimestamp(task.startedAt)}</small></td>
+                            <td><small>${task.completedAt ? formatTimestamp(task.completedAt) : '-'}</small></td>
+                        </tr>
+                    `;
+            }).join('');
+        }
+
+        // Update Workers Table
+        function updateWorkersTable() {
+            const tbody = document.getElementById('workersTableBody');
+            if (!tbody) return;
+
+            if (workersMap.size === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No workers connected</td></tr>';
+                return;
+            }
+
+            const workers = Array.from(workersMap.values());
+
+            workers.sort((a, b) => {
+                if (a.state === 'Busy' && b.state !== 'Busy') return -1;
+                if (a.state !== 'Busy' && b.state === 'Busy') return 1;
+                return (b.activeTasks || 0) - (a.activeTasks || 0);
+            });
+
+            tbody.innerHTML = workers.map(worker => {
+                const isOnline = (Date.now() - new Date(worker.lastHeartbeat).getTime()) < 30000;
+                const statusBadge = worker.state === 'Busy'
+                    ? '<span class="badge bg-warning">Busy</span>'
+                    : '<span class="badge bg-success">Idle</span>';
+
+                const onlineBadge = isOnline
+                    ? '<span class="badge bg-success ms-1">Online</span>'
+                    : '<span class="badge bg-danger ms-1">Offline</span>';
+
+                const cpuScore = worker.cpuUsage || 0;
+                const memoryScore = ((worker.memoryUsageMB || 0) / 4096.0) * 100;
+                const taskScore = ((worker.activeTasks || 0) / 10.0) * 100;
+                const loadScore = (cpuScore * 0.4) + (memoryScore * 0.3) + (taskScore * 0.3);
+
+                let loadBadgeClass = 'bg-success';
+                if (loadScore > 70) loadBadgeClass = 'bg-danger';
+                else if (loadScore > 40) loadBadgeClass = 'bg-warning';
+
+                const tasksDisplay = worker.activeTasks > 0
+                    ? `<span class="badge bg-primary">${worker.activeTasks} task${worker.activeTasks !== 1 ? 's' : ''}</span>`
+                    : '<span class="text-muted">0</span>';
+
+                return `
+                        <tr class="${isOnline ? '' : 'table-secondary'}">
+                            <td>
+                                <code>${worker.workerId}</code>
+                                ${onlineBadge}
+                            </td>
+                            <td>${statusBadge}</td>
+                            <td>${tasksDisplay}</td>
+                            <td>
+                                <div class="progress" style="height: 20px; min-width: 80px;">
+                                    <div class="progress-bar ${cpuScore > 80 ? 'bg-danger' : cpuScore > 50 ? 'bg-warning' : 'bg-success'}"
+                                         role="progressbar"
+                                         style="width: ${cpuScore}%">
+                                        ${cpuScore.toFixed(1)}%
+                                    </div>
+                                </div>
+                            </td>
+                            <td>
+                                <div class="progress" style="height: 20px; min-width: 80px;">
+                                    <div class="progress-bar bg-info"
+                                         role="progressbar"
+                                         style="width: ${memoryScore}%">
+                                        ${worker.memoryUsageMB.toFixed(0)} MB
+                                    </div>
+                                </div>
+                            </td>
+                            <td>
+                                <small>${formatTimestamp(worker.lastHeartbeat)}</small>
+                            </td>
+                            <td>
+                                <span class="badge ${loadBadgeClass}">${loadScore.toFixed(1)}</span>
+                            </td>
+                        </tr>
+                    `;
+            }).join('');
+        }
+
+        // Helper Functions
+        function getStatusBadge(status) {
+            const badges = {
+                'Completed': '<span class="badge bg-success">Completed</span>',
+                'Processing': '<span class="badge bg-primary">Processing</span>',
+                'Pending': '<span class="badge bg-warning">Pending</span>',
+                'Failed': '<span class="badge bg-danger">Failed</span>',
+                'Completed with Errors': '<span class="badge bg-warning">Completed with Errors</span>'
+            };
+            return badges[status] || '<span class="badge bg-secondary">Unknown</span>';
+        }
+
+        function getTaskStatusBadge(status) {
+            const badges = {
+                'Completed': '<span class="badge bg-success">Completed</span>',
+                'Processing': '<span class="badge bg-primary">Processing</span>',
+                'Pending': '<span class="badge bg-secondary">Pending</span>',
+                'Failed': '<span class="badge bg-danger">Failed</span>'
+            };
+            return badges[status] || '<span class="badge bg-secondary">Unknown</span>';
+        }
+
+        function getProgressBar(progress, status) {
+            let progressBarClass = 'bg-primary';
+            if (status === 'Completed') progressBarClass = 'bg-success';
+            if (status === 'Failed') progressBarClass = 'bg-danger';
+
+            return `
+                    <div class="progress">
+                        <div class="progress-bar ${progressBarClass}"
+                             role="progressbar"
+                             style="width: ${progress}%">
+                            ${progress}%
+                        </div>
+                    </div>
+                `;
+        }
+
+        function formatTimestamp(timestamp) {
+            if (!timestamp) return '-';
+            const date = new Date(timestamp);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffSecs = Math.floor(diffMs / 1000);
+
+            if (diffSecs < 10) return 'Just now';
+            if (diffSecs < 60) return `${diffSecs}s ago`;
+            if (diffSecs < 3600) return `${Math.floor(diffSecs / 60)}m ago`;
+
+            return date.toLocaleTimeString();
+        }
+
+        function addLog(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            if (!logContainer) {
+                console.log(`[LOG ${type}]:`, message);
+                return;
+            }
+
+            const timestamp = new Date().toLocaleTimeString();
+            const alertClass = `alert-${type}`;
+
+            const logEntry = document.createElement('div');
+            logEntry.className = `alert ${alertClass} alert-dismissible fade show mb-2`;
+            logEntry.innerHTML = `
+                    <small>${timestamp}</small> ${message}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                `;
+
+            logContainer.insertBefore(logEntry, logContainer.firstChild);
+
+            while (logContainer.children.length > 10) {
+                logContainer.removeChild(logContainer.lastChild);
+            }
+        }
+
+        // Submit Job Function
+        async function submitJob() {
+            const fundSelect = document.getElementById('fundSelect');
+            const selectedFunds = Array.from(fundSelect.selectedOptions).map(opt => opt.value);
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            const messageDiv = document.getElementById('message');
+            const submitBtn = document.getElementById('submitBtn');
+
+            if (selectedFunds.length === 0) {
+                messageDiv.innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle"></i> Please select at least one fund</div>';
+                return;
+            }
+
+            if (!startDate || !endDate) {
+                messageDiv.innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle"></i> Please select date range</div>';
+                return;
+            }
+
+            if (new Date(endDate) < new Date(startDate)) {
+                messageDiv.innerHTML = '<div class="alert alert-warning"><i class="bi bi-exclamation-triangle"></i> End date must be after start date</div>';
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Submitting...';
+
+            try {
+                const response = await fetch(`${API_URL}/api/job/submit-batch`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        funds: selectedFunds,
+                        startDate: startDate,
+                        endDate: endDate
+                    })
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+
+                    const estimatedTime = result.estimatedCompletion ? new Date(result.estimatedCompletion).toLocaleTimeString() : 'N/A';
+
+                    messageDiv.innerHTML = `
+                            <div class="alert alert-success">
+                                <i class="bi bi-check-circle"></i> <strong>Job Submitted Successfully!</strong>
+                                <ul class="mb-0 mt-2">
+                                    <li><strong>Job ID:</strong> <code>${result.jobId.substring(0, 8)}</code></li>
+                                    <li><strong>Funds:</strong> ${result.fund}</li>
+                                    <li><strong>Symbols:</strong> ${result.symbolsToProcess}</li>
+                                    <li><strong>Total Rows:</strong> ${result.totalRows.toLocaleString()}</li>
+                                    <li><strong>Est. Completion:</strong> ${estimatedTime}</li>
+                                </ul>
+                            </div>
+                        `;
+
+                    addLog(`Batch job submitted: ${result.jobId} for funds: ${result.fund}`, 'success');
+                } else {
+                    const errorData = await response.json();
+                    messageDiv.innerHTML = `<div class="alert alert-danger"><i class="bi bi-x-circle"></i> ${errorData.message || 'Job submission failed'}</div>`;
+                    addLog('Job submission failed', 'danger');
+                }
+            } catch (err) {
+                messageDiv.innerHTML = `<div class="alert alert-danger"><i class="bi bi-x-circle"></i> Error: ${err.message}</div>`;
+                addLog(`Job submission failed: ${err.message}`, 'danger');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="bi bi-play-fill"></i> Submit Job';
+            }
+        }
+
+        // Load Funds
+        async function loadFunds() {
+            const fundSelect = document.getElementById('fundSelect');
+
+            try {
+                fundSelect.innerHTML = '<option disabled>Loading...</option>';
+
+                const response = await fetch(`${API_URL}/api/dashboard/funds`);
+
+                if (!response.ok) {
+                    throw new Error(`Failed to load funds: ${response.statusText}`);
+                }
+
+                const funds = await response.json();
+
+                if (funds.length === 0) {
+                    fundSelect.innerHTML = '<option disabled>No funds available</option>';
+                    addLog('No funds found in database', 'warning');
+                    return;
+                }
+
+                fundSelect.innerHTML = '';
+                funds.forEach(fund => {
+                    const option = document.createElement('option');
+                    option.value = fund;
+                    option.textContent = fund;
+                    fundSelect.appendChild(option);
+                });
+
+                addLog(`Loaded ${funds.length} fund(s) from database`, 'success');
+
+            } catch (err) {
+                console.error('Error loading funds:', err);
+                fundSelect.innerHTML = '<option disabled>Error loading funds</option>';
+                addLog(`Failed to load funds: ${err.message}`, 'danger');
+            }
+        }
+
+        function selectAllFunds() {
+            const fundSelect = document.getElementById('fundSelect');
+            for (let option of fundSelect.options) {
+                if (!option.disabled) {
+                    option.selected = true;
+                }
+            }
+            updateFundDisplay();
+        }
+
+        function clearFundSelection() {
+            const fundSelect = document.getElementById('fundSelect');
+            for (let option of fundSelect.options) {
+                option.selected = false;
+            }
+            updateFundDisplay();
+        }
+
+        function updateFundDisplay() {
+            const fundSelect = document.getElementById('fundSelect');
+            const selectedOptions = Array.from(fundSelect.selectedOptions)
+                .filter(opt => !opt.disabled)
+                .map(opt => opt.textContent);
+            document.getElementById('selectedFundsDisplay').textContent =
+                selectedOptions.length > 0 ? selectedOptions.join(', ') : 'None';
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function () {
+            document.getElementById('endDate').valueAsDate = new Date();
+            const startDate = new Date();
+            startDate.setDate(startDate.getDate() - 30);
+            document.getElementById('startDate').valueAsDate = startDate;
+
+            loadFunds();
+            startConnection();
+
+            document.getElementById('fundSelect').addEventListener('change', updateFundDisplay);
+        });
+    </script>
+
+</body>
+</html>
