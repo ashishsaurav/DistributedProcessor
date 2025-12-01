@@ -24,13 +24,12 @@ namespace DistributedProcessor.Worker.Services
         private readonly HttpClient _httpClient;
         private readonly string _workerId;
         private int _activeTasks = 0;
-
+        private int _totalProcessed = 0;
         private const string TaskTopic = "processing-tasks";
         private const string ResultTopic = "processing-results";
 
         // CPU and Memory monitoring
         private PerformanceCounter _cpuCounter;
-        private PerformanceCounter _memoryCounter;
         private Process _currentProcess;
 
         public WorkerService(
@@ -56,12 +55,13 @@ namespace DistributedProcessor.Worker.Services
 
             _taskConsumer = new ConsumerBuilder<string, string>(consumerConfig).Build();
             _resultProducer = new ProducerBuilder<string, string>(producerConfig).Build();
+
             _httpClient = new HttpClient
             {
-                BaseAddress = new Uri(configuration["ApiUrl"] ?? "http://localhost:5000")
+                BaseAddress = new Uri(configuration["ApiUrl"] ?? "http://localhost:5000"),
+                Timeout = TimeSpan.FromSeconds(5)
             };
 
-            // Initialize performance counters (Windows only)
             InitializePerformanceCounters();
         }
 
@@ -76,10 +76,7 @@ namespace DistributedProcessor.Worker.Services
                         "% Processor Time",
                         "_Total",
                         true);
-
-                    // Prime the counter (first call returns 0)
                     _cpuCounter.NextValue();
-
                     _logger.LogInformation("Performance counters initialized (Windows)");
                 }
                 else
@@ -98,6 +95,7 @@ namespace DistributedProcessor.Worker.Services
             _taskConsumer.Subscribe(TaskTopic);
             _logger.LogInformation($"Worker {_workerId} subscribed to {TaskTopic}");
 
+            // Start background heartbeat task with 1-second interval
             var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(stoppingToken), stoppingToken);
 
             try
@@ -105,18 +103,17 @@ namespace DistributedProcessor.Worker.Services
                 while (!stoppingToken.IsCancellationRequested)
                 {
                     ProcessingTask task = null;
+                    Stopwatch taskStopwatch = null;
 
                     try
                     {
                         var consumeResult = _taskConsumer.Consume(stoppingToken);
-
                         if (consumeResult == null || consumeResult.IsPartitionEOF)
                         {
                             continue;
                         }
 
                         task = JsonSerializer.Deserialize<ProcessingTask>(consumeResult.Message.Value);
-
                         if (task == null)
                         {
                             _logger.LogWarning("Received null task, skipping");
@@ -124,24 +121,27 @@ namespace DistributedProcessor.Worker.Services
                             continue;
                         }
 
+                        // IMMEDIATE STATUS UPDATE: Task starting
                         Interlocked.Increment(ref _activeTasks);
+                        await SendImmediateHeartbeatAsync(stoppingToken); // NEW: Instant update
+
+                        taskStopwatch = Stopwatch.StartNew();
 
                         try
                         {
                             _logger.LogInformation($"Worker {_workerId} processing task {task.TaskId} from partition {consumeResult.Partition.Value} ({task.Fund}/{task.Symbol}, {task.Rows.Count} rows)");
 
+                            // Update to Processing status
                             await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
 
-                            var stopwatch = Stopwatch.StartNew();
+                            // Process the task
                             var calculatedRows = new List<CalculatedRow>();
-
                             decimal previousValue = 0;
                             decimal cumulativeReturns = 0;
 
                             foreach (var row in task.Rows.OrderBy(r => r.Date))
                             {
                                 decimal returns = 0;
-
                                 if (previousValue > 0)
                                 {
                                     returns = (row.Value - previousValue) / previousValue;
@@ -155,15 +155,26 @@ namespace DistributedProcessor.Worker.Services
                                     Returns = returns,
                                     CumulativeReturns = cumulativeReturns
                                 };
-                                calculatedRows.Add(calculated);
 
+                                calculatedRows.Add(calculated);
                                 previousValue = row.Value;
                             }
 
-                            stopwatch.Stop();
+                            _logger.LogInformation($"Worker {_workerId} simulating 5-second processing delay for task {task.TaskId}");
+                            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
-                            await UpdateTaskStatusAsync(task.TaskId, "Completed", _workerId, stoppingToken, calculatedRows.Count);
+                            taskStopwatch.Stop();
 
+                            // Update to Processed status (worker finished, before sending to Kafka)
+                            await UpdateTaskStatusAsync(
+                                task.TaskId,
+                                "Processed",
+                                _workerId,
+                                stoppingToken,
+                                calculatedRows.Count,
+                                taskStopwatch.ElapsedMilliseconds);
+
+                            // Create and publish result
                             var result = new ProcessingResult
                             {
                                 TaskId = task.TaskId,
@@ -173,7 +184,8 @@ namespace DistributedProcessor.Worker.Services
                                 Symbol = task.Symbol,
                                 CalculatedRows = calculatedRows,
                                 ProcessedAt = DateTime.UtcNow,
-                                Success = true
+                                Success = true,
+                                ProcessingDurationMs = taskStopwatch.ElapsedMilliseconds
                             };
 
                             var message = new Message<string, string>
@@ -185,15 +197,24 @@ namespace DistributedProcessor.Worker.Services
                             await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
                             _taskConsumer.Commit(consumeResult);
 
-                            _logger.LogInformation($"Worker {_workerId} completed task {task.TaskId} in {stopwatch.ElapsedMilliseconds}ms ({calculatedRows.Count} rows)");
+                            Interlocked.Increment(ref _totalProcessed);
+                            _logger.LogInformation($"Worker {_workerId} completed task {task.TaskId} in {taskStopwatch.ElapsedMilliseconds}ms ({calculatedRows.Count} rows)");
                         }
                         catch (Exception taskEx)
                         {
+                            taskStopwatch?.Stop();
                             _logger.LogError(taskEx, $"Error processing task {task?.TaskId}");
 
                             if (task != null)
                             {
-                                await UpdateTaskStatusAsync(task.TaskId, "Failed", _workerId, stoppingToken);
+                                await UpdateTaskStatusAsync(
+                                    task.TaskId,
+                                    "Failed",
+                                    _workerId,
+                                    stoppingToken,
+                                    0,
+                                    taskStopwatch?.ElapsedMilliseconds ?? 0,
+                                    taskEx.Message);
 
                                 var failureResult = new ProcessingResult
                                 {
@@ -204,7 +225,8 @@ namespace DistributedProcessor.Worker.Services
                                     Symbol = task.Symbol,
                                     Success = false,
                                     ErrorMessage = taskEx.Message,
-                                    ProcessedAt = DateTime.UtcNow
+                                    ProcessedAt = DateTime.UtcNow,
+                                    ProcessingDurationMs = taskStopwatch?.ElapsedMilliseconds ?? 0
                                 };
 
                                 var failureMessage = new Message<string, string>
@@ -219,7 +241,9 @@ namespace DistributedProcessor.Worker.Services
                         }
                         finally
                         {
+                            // IMMEDIATE STATUS UPDATE: Task ended
                             Interlocked.Decrement(ref _activeTasks);
+                            await SendImmediateHeartbeatAsync(stoppingToken); // NEW: Instant update
                         }
                     }
                     catch (ConsumeException cex)
@@ -245,7 +269,14 @@ namespace DistributedProcessor.Worker.Services
             }
         }
 
-        private async Task UpdateTaskStatusAsync(string taskId, string status, string workerId = null, CancellationToken stoppingToken = default, int rowCount = 0)
+        private async Task UpdateTaskStatusAsync(
+    string taskId,
+    string status,
+    string workerId = null,
+    CancellationToken stoppingToken = default,
+    int rowCount = 0,
+    long durationMs = 0,
+    string errorMessage = null)
         {
             try
             {
@@ -254,7 +285,9 @@ namespace DistributedProcessor.Worker.Services
                     taskId = taskId,
                     status = status,
                     workerId = workerId ?? _workerId,
-                    rowCount = rowCount
+                    rowCount = rowCount,
+                    durationMs = durationMs,
+                    errorMessage = errorMessage
                 };
 
                 var response = await _httpClient.PutAsJsonAsync($"/api/task/update-status", updateData, stoppingToken);
@@ -274,15 +307,39 @@ namespace DistributedProcessor.Worker.Services
             }
         }
 
+        // NEW: Send immediate heartbeat on task state change
+        private async Task SendImmediateHeartbeatAsync(CancellationToken stoppingToken)
+        {
+            try
+            {
+                string currentState = _activeTasks > 0 ? "Busy" : "Idle";
+                var status = new WorkerStatus
+                {
+                    WorkerId = _workerId,
+                    State = currentState,
+                    ActiveTasks = _activeTasks,
+                    CpuUsage = GetCpuUsage(),
+                    MemoryUsageMB = GetMemoryUsage(),
+                    LastHeartbeat = DateTime.UtcNow,
+                    TotalProcessed = _totalProcessed
+                };
+
+                await _httpClient.PostAsJsonAsync("/api/health/update", status, stoppingToken);
+                _logger.LogDebug($"Immediate heartbeat: State={currentState}, Tasks={_activeTasks}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to send immediate heartbeat");
+            }
+        }
+
         private async Task SendHeartbeatsAsync(CancellationToken stoppingToken)
         {
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    // Determine current state based on active tasks
                     string currentState = _activeTasks > 0 ? "Busy" : "Idle";
-
                     var status = new WorkerStatus
                     {
                         WorkerId = _workerId,
@@ -290,7 +347,8 @@ namespace DistributedProcessor.Worker.Services
                         ActiveTasks = _activeTasks,
                         CpuUsage = GetCpuUsage(),
                         MemoryUsageMB = GetMemoryUsage(),
-                        LastHeartbeat = DateTime.UtcNow
+                        LastHeartbeat = DateTime.UtcNow,
+                        TotalProcessed = _totalProcessed
                     };
 
                     var response = await _httpClient.PostAsJsonAsync("/api/health/update", status, stoppingToken);
@@ -305,7 +363,8 @@ namespace DistributedProcessor.Worker.Services
                     _logger.LogWarning(ex, "Failed to send heartbeat");
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                // Reduced from 5 seconds to 1 second
+                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
             }
         }
 
@@ -315,12 +374,10 @@ namespace DistributedProcessor.Worker.Services
             {
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && _cpuCounter != null)
                 {
-                    // Windows: Use PerformanceCounter
                     return _cpuCounter.NextValue();
                 }
                 else
                 {
-                    // Linux/Mac: Use process CPU time calculation
                     return GetCpuUsageCrossPlatform();
                 }
             }
@@ -338,7 +395,7 @@ namespace DistributedProcessor.Worker.Services
                 var startTime = DateTime.UtcNow;
                 var startCpuUsage = _currentProcess.TotalProcessorTime;
 
-                Thread.Sleep(100); // Short delay
+                Thread.Sleep(100);
 
                 var endTime = DateTime.UtcNow;
                 var endCpuUsage = _currentProcess.TotalProcessorTime;
@@ -360,7 +417,7 @@ namespace DistributedProcessor.Worker.Services
             try
             {
                 _currentProcess.Refresh();
-                return _currentProcess.WorkingSet64 / 1024.0 / 1024.0; // Convert to MB
+                return _currentProcess.WorkingSet64 / 1024.0 / 1024.0;
             }
             catch (Exception ex)
             {
@@ -372,7 +429,6 @@ namespace DistributedProcessor.Worker.Services
         public override void Dispose()
         {
             _cpuCounter?.Dispose();
-            _memoryCounter?.Dispose();
             _taskConsumer?.Dispose();
             _resultProducer?.Dispose();
             _httpClient?.Dispose();

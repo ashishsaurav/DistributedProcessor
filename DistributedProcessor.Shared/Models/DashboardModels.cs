@@ -3,6 +3,7 @@
     public class DashboardState
     {
         public List<WorkerStatus> Workers { get; set; } = new();
+        public List<CollectorStatus> Collectors { get; set; } = new(); // NEW
         public List<JobSummary> Jobs { get; set; } = new();
         public List<TaskSummary> Tasks { get; set; } = new();
         public CollectorStats CollectorStats { get; set; } = new();
@@ -14,13 +15,14 @@
         public string JobId { get; set; }
         public string Fund { get; set; }
         public DateTime SubmittedAt { get; set; }
-        public string Status { get; set; } // Pending, Processing, Completed, Failed
+        public string Status { get; set; }
         public int TotalTasks { get; set; }
         public int CompletedTasks { get; set; }
         public int PendingTasks { get; set; }
         public int FailedTasks { get; set; }
         public int TotalRows { get; set; }
         public int ProcessedRows { get; set; }
+        public int ProgressPercentage { get; set; }
     }
 
     public class TaskSummary
@@ -33,7 +35,11 @@
         public string? WorkerId { get; set; }
         public int RowsProcessed { get; set; }
         public DateTime? StartedAt { get; set; }
+        public DateTime? ProcessedAt { get; set; }
+        public DateTime? CollectedAt { get; set; }
         public DateTime? CompletedAt { get; set; }
+        public long? ProcessingDurationMs { get; set; }
+        public long? CollectionDurationMs { get; set; }
     }
 
     public class CollectorStats
@@ -49,9 +55,12 @@
         public int TotalWorkers { get; set; }
         public int ActiveWorkers { get; set; }
         public int BusyWorkers { get; set; }
+        public int TotalCollectors { get; set; } // NEW
+        public int ActiveCollectors { get; set; } // NEW
         public int TotalJobs { get; set; }
         public int ActiveJobs { get; set; }
         public int TotalTasksCompleted { get; set; }
+        public int TotalTasksProcessing { get; set; }
     }
 
     public class SymbolInfo

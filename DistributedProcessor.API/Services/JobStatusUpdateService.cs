@@ -1,4 +1,6 @@
 ﻿using DistributedProcessor.Data;
+using DistributedProcessor.API.Hubs;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,10 +22,9 @@ namespace DistributedProcessor.API.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Job Status Update Service started - Updating every 3 seconds");
+            _logger.LogInformation("Job Status Update Service started - Updating every 500ms for real-time visibility");
 
-            // Wait a bit before starting
-            await Task.Delay(2000, stoppingToken);
+            await Task.Delay(1000, stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -38,7 +39,6 @@ namespace DistributedProcessor.API.Services
 
                     foreach (var job in activeJobs)
                     {
-                        // Get all tasks for this job
                         var tasks = await context.TaskLogs
                             .Where(t => t.JobId == job.JobId)
                             .ToListAsync(stoppingToken);
@@ -50,30 +50,35 @@ namespace DistributedProcessor.API.Services
 
                         var totalTasks = tasks.Count;
                         var completedTasks = tasks.Count(t => t.Status == "Completed");
+                        var collectedTasks = tasks.Count(t => t.Status == "Collected");
                         var failedTasks = tasks.Count(t => t.Status == "Failed");
                         var processingTasks = tasks.Count(t => t.Status == "Processing");
+                        var processedTasks = tasks.Count(t => t.Status == "Processed");
                         var pendingTasks = tasks.Count(t => t.Status == "Pending");
 
                         // Calculate processed rows
-                        var processedRows = tasks.Sum(t => t.RowsProcessed ?? 0);
+                        var processedRows = tasks
+                            .Where(t => t.Status == "Completed" || t.Status == "Collected" || t.Status == "Processed")
+                            .Sum(t => t.RowsProcessed ?? 0);
 
-                        // Determine job status based on task states
+                        // FIXED: Determine job status - treat Collected as finished
                         string newStatus = job.Status;
                         DateTime? startedAt = job.StartedAt;
                         DateTime? completedAt = job.CompletedAt;
 
-                        if (completedTasks + failedTasks == totalTasks)
+                        // Count truly finished tasks (Collected + Completed + Failed)
+                        int finishedTasks = completedTasks + collectedTasks + failedTasks;
+
+                        if (finishedTasks == totalTasks)
                         {
                             // All tasks are done
                             newStatus = failedTasks > 0 ? "Completed with Errors" : "Completed";
                             completedAt = DateTime.UtcNow;
                         }
-                        else if (processingTasks > 0 || completedTasks > 0)
+                        else if (processingTasks > 0 || processedTasks > 0 || collectedTasks > 0 || completedTasks > 0)
                         {
-                            // At least one task has started - mark as Processing
+                            // At least one task has started or is in progress
                             newStatus = "Processing";
-
-                            // Set StartedAt if not already set
                             if (startedAt == null)
                             {
                                 startedAt = DateTime.UtcNow;
@@ -81,21 +86,19 @@ namespace DistributedProcessor.API.Services
                         }
                         // else stays "Pending"
 
-                        // Update job statistics
+                        // FIXED: Update completed tasks to include Collected
                         job.Status = newStatus;
-                        job.CompletedTasks = completedTasks;
+                        job.CompletedTasks = completedTasks + collectedTasks; // Include both
                         job.FailedTasks = failedTasks;
                         job.ProcessedRows = processedRows;
                         job.StartedAt = startedAt;
                         job.CompletedAt = completedAt;
 
-                        // Calculate PendingTasks (if you add this property to JobExecution)
-                        // job.PendingTasks = pendingTasks;
-
-                        _logger.LogDebug($"Job {job.JobId.Substring(0, 8)}: Status={newStatus}, Tasks={completedTasks}/{totalTasks}, Rows={processedRows}/{job.TotalRows}");
+                        _logger.LogDebug($"Job {job.JobId.Substring(0, 8)}: Status={newStatus}, " +
+                            $"Tasks=Cm:{completedTasks}/Cl:{collectedTasks}/P:{processingTasks}/Pd:{processedTasks}/Pn:{pendingTasks}/F:{failedTasks}, " +
+                            $"Rows={processedRows}/{job.TotalRows}");
                     }
 
-                    // Save all changes
                     var changedCount = await context.SaveChangesAsync(stoppingToken);
 
                     if (changedCount > 0)
@@ -108,9 +111,9 @@ namespace DistributedProcessor.API.Services
                     _logger.LogError(ex, "Error updating job statuses");
                 }
 
-                // Check every 3 seconds
-                await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+                await Task.Delay(TimeSpan.FromMilliseconds(500), stoppingToken);
             }
         }
+
     }
 }

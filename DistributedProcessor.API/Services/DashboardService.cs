@@ -10,8 +10,8 @@ namespace DistributedProcessor.API.Services
         Task<List<JobSummary>> GetJobSummariesAsync();
         Task<List<TaskSummary>> GetTaskSummariesAsync(string jobId = null);
         Task<CollectorStats> GetCollectorStatsAsync();
-        Task<List<string>> GetAvailableFundsAsync();  // NEW
-        Task<List<SymbolInfo>> GetAvailableSymbolsAsync(string fund = null);  // NEW
+        Task<List<string>> GetAvailableFundsAsync();
+        Task<List<SymbolInfo>> GetAvailableSymbolsAsync(string fund = null);
     }
 
     public class DashboardService : IDashboardService
@@ -44,7 +44,8 @@ namespace DistributedProcessor.API.Services
                 BusyWorkers = workers.Count(w => w.State == "Busy"),
                 TotalJobs = jobs.Count,
                 ActiveJobs = jobs.Count(j => j.Status == "Processing" || j.Status == "Pending"),
-                TotalTasksCompleted = await _context.TaskLogs.CountAsync(t => t.Status == "Completed")
+                TotalTasksCompleted = await _context.TaskLogs.CountAsync(t => t.Status == "Completed" || t.Status == "Collected"),
+                TotalTasksProcessing = await _context.TaskLogs.CountAsync(t => t.Status == "Processing" || t.Status == "Processed")
             };
 
             return new DashboardState
@@ -61,14 +62,15 @@ namespace DistributedProcessor.API.Services
         {
             try
             {
-                // Get jobs with real-time task aggregation from TaskLogs
                 var jobsWithStats = await (from job in _context.JobExecutions
                                            let completedCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Completed")
+                                           let collectedCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Collected")
                                            let failedCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Failed")
                                            let processingCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Processing")
+                                           let processedCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Processed")
                                            let pendingCount = _context.TaskLogs.Count(t => t.JobId == job.JobId && t.Status == "Pending")
                                            let processedRows = _context.TaskLogs
-                                               .Where(t => t.JobId == job.JobId && t.Status == "Completed")
+                                               .Where(t => t.JobId == job.JobId && (t.Status == "Completed" || t.Status == "Collected" || t.Status == "Processed"))
                                                .Sum(t => (int?)t.RowsProcessed) ?? 0
                                            select new
                                            {
@@ -78,26 +80,38 @@ namespace DistributedProcessor.API.Services
                                                job.TotalTasks,
                                                job.TotalRows,
                                                CompletedTasks = completedCount,
+                                               CollectedTasks = collectedCount,
                                                FailedTasks = failedCount,
                                                ProcessingTasks = processingCount,
+                                               ProcessedTasks = processedCount,
                                                PendingTasks = pendingCount,
                                                ProcessedRows = processedRows
                                            })
-                                            .OrderByDescending(j => j.SubmittedAt)
-                                            .ToListAsync();
+                    .OrderByDescending(j => j.SubmittedAt)
+                    .ToListAsync();
 
                 return jobsWithStats.Select(j => new JobSummary
                 {
                     JobId = j.JobId,
                     Fund = j.Fund,
                     SubmittedAt = j.SubmittedAt,
-                    Status = DetermineJobStatus(j.CompletedTasks, j.FailedTasks, j.ProcessingTasks, j.PendingTasks, j.TotalTasks),
+                    Status = DetermineJobStatus(
+                        j.CompletedTasks,
+                        j.FailedTasks,
+                        j.ProcessingTasks,
+                        j.ProcessedTasks,
+                        j.CollectedTasks,
+                        j.PendingTasks,
+                        j.TotalTasks),
                     TotalTasks = j.TotalTasks,
-                    CompletedTasks = j.CompletedTasks,
-                    PendingTasks = j.PendingTasks + j.ProcessingTasks,
+                    CompletedTasks = j.CompletedTasks + j.CollectedTasks, // FIXED: Include Collected as completed
+                    PendingTasks = j.PendingTasks + j.ProcessingTasks + j.ProcessedTasks, // FIXED: Don't include Collected
                     FailedTasks = j.FailedTasks,
                     TotalRows = j.TotalRows,
-                    ProcessedRows = j.ProcessedRows
+                    ProcessedRows = j.ProcessedRows,
+                    ProgressPercentage = j.TotalTasks > 0
+                        ? (int)((j.CompletedTasks + j.CollectedTasks + j.FailedTasks) * 100.0 / j.TotalTasks)
+                        : 0
                 }).ToList();
             }
             catch (Exception ex)
@@ -107,18 +121,36 @@ namespace DistributedProcessor.API.Services
             }
         }
 
-        private string DetermineJobStatus(int completed, int failed, int processing, int pending, int total)
+        private string DetermineJobStatus(int completed, int failed, int processing, int processed, int collected, int pending, int total)
         {
             if (total == 0) return "Pending";
 
-            if (processing > 0) return "Processing";
+            // Count tasks that are truly finished (Collected is the final working state)
+            int finishedTasks = completed + collected + failed;
 
-            if (completed + failed >= total)
+            // All tasks are done
+            if (finishedTasks >= total)
             {
                 return failed > 0 ? "Completed with Errors" : "Completed";
             }
 
-            if (pending > 0) return "Pending";
+            // Some tasks are actively being worked on
+            if (processing > 0 || processed > 0)
+            {
+                return "Processing";
+            }
+
+            // Tasks waiting in collector after being processed
+            if (collected > 0)
+            {
+                return "Processing";
+            }
+
+            // All tasks still pending
+            if (pending > 0)
+            {
+                return "Pending";
+            }
 
             return "Unknown";
         }
@@ -145,34 +177,32 @@ namespace DistributedProcessor.API.Services
                     WorkerId = t.WorkerId,
                     RowsProcessed = t.RowsProcessed ?? 0,
                     StartedAt = t.StartedAt,
-                    CompletedAt = t.CompletedAt
+                    ProcessedAt = t.ProcessedAt,
+                    CollectedAt = t.CollectedAt,
+                    CompletedAt = t.CompletedAt,
+                    ProcessingDurationMs = t.ProcessingDurationMs,
+                    CollectionDurationMs = t.CollectionDurationMs
                 })
                 .ToListAsync();
 
             return tasks;
         }
 
-
         public async Task<CollectorStats> GetCollectorStatsAsync()
         {
             var today = DateTime.UtcNow.Date;
 
-            // Total results collected
             var totalCollected = await _context.CalculatedResults.CountAsync();
-
-            // Results collected today
             var todayCollected = await _context.CalculatedResults
                 .CountAsync(r => r.CreatedAt >= today);
 
-            // Last collection time
             var lastCollection = await _context.CalculatedResults
                 .OrderByDescending(r => r.CreatedAt)
                 .Select(r => r.CreatedAt)
                 .FirstOrDefaultAsync();
 
-            // Consider collector running if last collection was within 5 minutes
             var isRunning = lastCollection != default &&
-                            (DateTime.UtcNow - lastCollection).TotalMinutes < 5;
+                           (DateTime.UtcNow - lastCollection).TotalMinutes < 5;
 
             return new CollectorStats
             {

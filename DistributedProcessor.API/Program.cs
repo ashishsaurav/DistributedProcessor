@@ -30,6 +30,8 @@ builder.Services.AddScoped<IDashboardService, DashboardService>();
 builder.Services.AddSingleton<ISmartTaskDispatcher, SmartTaskDispatcher>();
 builder.Services.AddHostedService<DashboardUpdateService>();
 builder.Services.AddHostedService<JobStatusUpdateService>();
+builder.Services.AddSingleton<ICollectorHealthService, CollectorHealthService>();
+
 
 builder.Services.AddCors(options =>
 {

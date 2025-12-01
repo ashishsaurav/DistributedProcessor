@@ -21,7 +21,7 @@ namespace DistributedProcessor.Shared.Models
         public string Fund { get; set; }
         public string Symbol { get; set; }
         public DateTime Date { get; set; }
-        public decimal Value { get; set; }  // Changed from Price to Value
+        public decimal Value { get; set; }
     }
 
     public class ProcessingResult
@@ -35,6 +35,7 @@ namespace DistributedProcessor.Shared.Models
         public DateTime ProcessedAt { get; set; } = DateTime.UtcNow;
         public bool Success { get; set; }
         public string ErrorMessage { get; set; }
+        public long ProcessingDurationMs { get; set; } // NEW: Track processing time
     }
 
     public class CalculatedRow

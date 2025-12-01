@@ -100,8 +100,9 @@
     </nav>
 
     <div class="container-fluid mt-4">
-        <!-- System Metrics Row -->
-        <div class="row mb-4">
+        <!-- System Metrics Row - EXPANDED -->
+        <div class="row mb-3">
+            <!-- Workers Section -->
             <div class="col-md-2">
                 <div class="card metrics-card">
                     <div class="card-body text-center">
@@ -129,6 +130,39 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Collectors Section -->
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-database fs-2 text-info"></i>
+                        <h6 class="mt-2">Total Collectors</h6>
+                        <h2 id="totalCollectors">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-check-circle fs-2 text-success"></i>
+                        <h6 class="mt-2">Idle Collectors</h6>
+                        <h2 id="idleCollectors">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-arrow-down-circle fs-2 text-warning"></i>
+                        <h6 class="mt-2">Busy Collectors</h6>
+                        <h2 id="busyCollectors">0</h2>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Second Row - Jobs and Tasks -->
+        <div class="row mb-4">
             <div class="col-md-2">
                 <div class="card metrics-card">
                     <div class="card-body text-center">
@@ -150,9 +184,36 @@
             <div class="col-md-2">
                 <div class="card metrics-card">
                     <div class="card-body text-center">
-                        <i class="bi bi-check-all fs-2 text-success"></i>
+                        <i class="bi bi-list-task fs-2 text-success"></i>
                         <h6 class="mt-2">Active Tasks</h6>
-                        <h2 id="totalActiveTasks">0</h2>
+                        <h2 id="activeTasks">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-check-all fs-2 text-success"></i>
+                        <h6 class="mt-2">Tasks Completed</h6>
+                        <h2 id="tasksCompleted">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-graph-up fs-2 text-primary"></i>
+                        <h6 class="mt-2">Tasks Processing</h6>
+                        <h2 id="tasksProcessing">0</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="card metrics-card">
+                    <div class="card-body text-center">
+                        <i class="bi bi-clock-history fs-2 text-secondary"></i>
+                        <h6 class="mt-2">Tasks Pending</h6>
+                        <h2 id="tasksPending">0</h2>
                     </div>
                 </div>
             </div>
@@ -202,11 +263,16 @@
             </div>
         </div>
 
-        <!-- Tabs for Workers, Jobs, Tasks -->
+        <!-- Tabs for Workers, Collectors, Jobs, Tasks -->
         <ul class="nav nav-tabs" id="mainTabs" role="tablist">
             <li class="nav-item" role="presentation">
                 <button class="nav-link active" id="workers-tab" data-bs-toggle="tab" data-bs-target="#workers" type="button">
                     <i class="bi bi-hdd-rack"></i> Workers
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="collectors-tab" data-bs-toggle="tab" data-bs-target="#collectors" type="button">
+                    <i class="bi bi-database"></i> Collectors
                 </button>
             </li>
             <li class="nav-item" role="presentation">
@@ -241,11 +307,38 @@
                                         <th>CPU %</th>
                                         <th>Memory (MB)</th>
                                         <th>Last Heartbeat</th>
-                                        <th>Load Score</th>
+                                        <th>Total Processed</th>
                                     </tr>
                                 </thead>
                                 <tbody id="workersTableBody">
                                     <tr><td colspan="7" class="text-center text-muted">Loading workers...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Collectors Tab -->
+            <div class="tab-pane fade" id="collectors" role="tabpanel">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Collector ID</th>
+                                        <th>Status</th>
+                                        <th>Active Collections</th>
+                                        <th>CPU %</th>
+                                        <th>Memory (MB)</th>
+                                        <th>Last Heartbeat</th>
+                                        <th>Total Collected</th>
+                                        <th>Avg Time (ms)</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="collectorsTableBody">
+                                    <tr><td colspan="8" class="text-center text-muted">Loading collectors...</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -296,10 +389,11 @@
                                         <th>Rows</th>
                                         <th>Started</th>
                                         <th>Completed</th>
+                                        <th>Duration</th>
                                     </tr>
                                 </thead>
                                 <tbody id="tasksTableBody">
-                                    <tr><td colspan="8" class="text-center text-muted">No tasks created yet</td></tr>
+                                    <tr><td colspan="9" class="text-center text-muted">No tasks created yet</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -323,6 +417,7 @@
     <script>
         const API_URL = 'http://localhost:5000';
         const workersMap = new Map();
+        const collectorsMap = new Map();
         let jobsData = [];
         let tasksData = [];
 
@@ -345,12 +440,46 @@
             console.log("TasksUpdate received:", tasks);
             tasksData = tasks;
             updateTasksTable();
+            updateMetrics();
         });
 
         connection.on("WorkersUpdate", function (workers) {
             console.log("WorkersUpdate received:", workers);
             workers.forEach(w => workersMap.set(w.workerId, w));
             updateWorkersTable();
+            updateMetrics();
+        });
+
+        connection.on("CollectorsUpdate", function (collectors) {
+            console.log("CollectorsUpdate received:", collectors);
+            collectors.forEach(c => collectorsMap.set(c.collectorId, c));
+            updateCollectorsTable();
+            updateMetrics();
+        });
+
+        connection.on("TaskStatusChanged", function (task) {
+            console.log("TaskStatusChanged:", task);
+            addLog(`Task ${task.taskId.substring(0, 8)} status: ${task.status}`, 'info');
+
+            const index = tasksData.findIndex(t => t.taskId === task.taskId);
+            if (index >= 0) {
+                tasksData[index] = task;
+            } else {
+                tasksData.unshift(task);
+            }
+            updateTasksTable();
+            updateMetrics();
+        });
+
+        connection.on("JobStatusChanged", function (job) {
+            console.log("JobStatusChanged:", job);
+            addLog(`Job ${job.jobId.substring(0, 8)} status: ${job.status} (${job.completedTasks}/${job.totalTasks})`, 'success');
+
+            const index = jobsData.findIndex(j => j.jobId === job.jobId);
+            if (index >= 0) {
+                jobsData[index] = { ...jobsData[index], ...job };
+            }
+            updateJobsTable();
             updateMetrics();
         });
 
@@ -390,11 +519,13 @@
             setTimeout(startConnection, 5000);
         });
 
-        // Update Metrics
+        // Update Metrics - ENHANCED
         function updateMetrics() {
             const workers = Array.from(workersMap.values());
+            const collectors = Array.from(collectorsMap.values());
             const now = Date.now();
 
+            // Workers Metrics
             const onlineWorkers = workers.filter(w =>
                 (now - new Date(w.lastHeartbeat).getTime()) < 30000
             );
@@ -402,18 +533,42 @@
             const totalWorkers = onlineWorkers.length;
             const idleWorkers = onlineWorkers.filter(w => w.state === 'Idle').length;
             const busyWorkers = onlineWorkers.filter(w => w.state === 'Busy').length;
-            const totalActiveTasks = onlineWorkers.reduce((sum, w) => sum + (w.activeTasks || 0), 0);
+            const totalActiveTasksOnWorkers = onlineWorkers.reduce((sum, w) => sum + (w.activeTasks || 0), 0);
 
             document.getElementById('totalWorkers').textContent = totalWorkers;
             document.getElementById('idleWorkers').textContent = idleWorkers;
             document.getElementById('busyWorkers').textContent = busyWorkers;
-            document.getElementById('totalActiveTasks').textContent = totalActiveTasks;
 
+            // Collectors Metrics
+            const onlineCollectors = collectors.filter(c =>
+                (now - new Date(c.lastHeartbeat).getTime()) < 30000
+            );
+
+            const totalCollectors = onlineCollectors.length;
+            const idleCollectors = onlineCollectors.filter(c => c.state === 'Idle').length;
+            const busyCollectors = onlineCollectors.filter(c => c.state === 'Collecting').length;
+
+            document.getElementById('totalCollectors').textContent = totalCollectors;
+            document.getElementById('idleCollectors').textContent = idleCollectors;
+            document.getElementById('busyCollectors').textContent = busyCollectors;
+
+            // Jobs Metrics
             const totalJobs = jobsData.length;
             const activeJobs = jobsData.filter(j => j.status === 'Processing').length;
 
             document.getElementById('totalJobs').textContent = totalJobs;
             document.getElementById('activeJobs').textContent = activeJobs;
+
+            // Tasks Metrics
+            const pendingTasks = tasksData.filter(t => t.status === 'Pending').length;
+            const processingTasks = tasksData.filter(t => t.status === 'Processing').length;
+            const processedTasks = tasksData.filter(t => t.status === 'Processed').length;
+            const completedTasks = tasksData.filter(t => t.status === 'Completed' || t.status === 'Collected').length;
+
+            document.getElementById('activeTasks').textContent = totalActiveTasksOnWorkers;
+            document.getElementById('tasksCompleted').textContent = completedTasks;
+            document.getElementById('tasksProcessing').textContent = processingTasks + processedTasks;
+            document.getElementById('tasksPending').textContent = pendingTasks;
         }
 
         // Update Jobs Table
@@ -427,7 +582,7 @@
             }
 
             tbody.innerHTML = jobsData.map(job => {
-                const progress = job.totalTasks > 0 ? Math.round((job.completedTasks / job.totalTasks) * 100) : 0;
+                const progress = job.progressPercentage || 0;
                 const statusBadge = getStatusBadge(job.status);
                 const progressBar = getProgressBar(progress, job.status);
 
@@ -452,7 +607,7 @@
             if (!tbody) return;
 
             if (tasksData.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No tasks created yet</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">No tasks created yet</td></tr>';
                 return;
             }
 
@@ -460,27 +615,57 @@
 
             tbody.innerHTML = recentTasks.map(task => {
                 const statusBadge = getTaskStatusBadge(task.status);
-
-                // ✅ Show worker ID or dash
                 const workerDisplay = task.workerId
-                    ? `<small><code>${task.workerId}</code></small>`
+                    ? `<small><code>${task.workerId.substring(0, 12)}</code></small>`
                     : '<span class="text-muted">-</span>';
 
+                const completedTime = getCompletionTime(task);
+                const durationDisplay = getTotalDuration(task);
+
                 return `
-            <tr>
-                <td><code>${task.taskId.substring(0, 8)}</code></td>
-                <td><code>${task.jobId.substring(0, 8)}</code></td>
-                <td>${task.fund}/${task.symbol}</td>
-                <td>${statusBadge}</td>
-                <td>${workerDisplay}</td>
-                <td>${task.rowsProcessed || 0}</td>
-                <td><small>${formatTimestamp(task.startedAt)}</small></td>
-                <td><small>${task.completedAt ? formatTimestamp(task.completedAt) : '-'}</small></td>
-            </tr>
-        `;
+                        <tr>
+                            <td><code>${task.taskId.substring(0, 8)}</code></td>
+                            <td><code>${task.jobId.substring(0, 8)}</code></td>
+                            <td>${task.fund}/${task.symbol}</td>
+                            <td>${statusBadge}</td>
+                            <td>${workerDisplay}</td>
+                            <td>${task.rowsProcessed || 0}</td>
+                            <td><small>${formatTimestamp(task.startedAt)}</small></td>
+                            <td><small>${completedTime}</small></td>
+                            <td><small>${durationDisplay}</small></td>
+                        </tr>
+                    `;
             }).join('');
         }
 
+        function getCompletionTime(task) {
+            if (task.completedAt) {
+                return formatTimestamp(task.completedAt);
+            } else if (task.collectedAt) {
+                return formatTimestamp(task.collectedAt) + ' 📦';
+            } else if (task.processedAt) {
+                return formatTimestamp(task.processedAt) + ' ✓';
+            }
+            return '-';
+        }
+
+        function getTotalDuration(task) {
+            const processingMs = task.processingDurationMs || 0;
+            const collectionMs = task.collectionDurationMs || 0;
+            const totalMs = processingMs + collectionMs;
+
+            if (totalMs === 0) return '-';
+
+            if (processingMs > 0 && collectionMs > 0) {
+                return `${totalMs}ms (P:${processingMs} + C:${collectionMs})`;
+            } else if (processingMs > 0) {
+                return `${processingMs}ms (processing)`;
+            } else if (collectionMs > 0) {
+                return `${collectionMs}ms (collection)`;
+            }
+
+            return `${totalMs}ms`;
+        }
 
         // Update Workers Table
         function updateWorkersTable() {
@@ -503,8 +688,8 @@
             tbody.innerHTML = workers.map(worker => {
                 const isOnline = (Date.now() - new Date(worker.lastHeartbeat).getTime()) < 30000;
                 const statusBadge = worker.state === 'Busy'
-                    ? '<span class="badge bg-warning">Busy</span>'
-                    : '<span class="badge bg-success">Idle</span>';
+                    ? '<span class="badge bg-warning">⚙️ Busy</span>'
+                    : '<span class="badge bg-success">✓ Idle</span>';
 
                 const onlineBadge = isOnline
                     ? '<span class="badge bg-success ms-1">Online</span>'
@@ -512,12 +697,6 @@
 
                 const cpuScore = worker.cpuUsage || 0;
                 const memoryScore = ((worker.memoryUsageMB || 0) / 4096.0) * 100;
-                const taskScore = ((worker.activeTasks || 0) / 10.0) * 100;
-                const loadScore = (cpuScore * 0.4) + (memoryScore * 0.3) + (taskScore * 0.3);
-
-                let loadBadgeClass = 'bg-success';
-                if (loadScore > 70) loadBadgeClass = 'bg-danger';
-                else if (loadScore > 40) loadBadgeClass = 'bg-warning';
 
                 const tasksDisplay = worker.activeTasks > 0
                     ? `<span class="badge bg-primary">${worker.activeTasks} task${worker.activeTasks !== 1 ? 's' : ''}</span>`
@@ -553,7 +732,82 @@
                                 <small>${formatTimestamp(worker.lastHeartbeat)}</small>
                             </td>
                             <td>
-                                <span class="badge ${loadBadgeClass}">${loadScore.toFixed(1)}</span>
+                                <span class="badge bg-success">${worker.totalProcessed || 0}</span>
+                            </td>
+                        </tr>
+                    `;
+            }).join('');
+        }
+
+        // Update Collectors Table
+        function updateCollectorsTable() {
+            const tbody = document.getElementById('collectorsTableBody');
+            if (!tbody) return;
+
+            if (collectorsMap.size === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No collectors connected</td></tr>';
+                return;
+            }
+
+            const collectors = Array.from(collectorsMap.values());
+
+            collectors.sort((a, b) => {
+                if (a.state === 'Collecting' && b.state !== 'Collecting') return -1;
+                if (a.state !== 'Collecting' && b.state === 'Collecting') return 1;
+                return (b.activeCollections || 0) - (a.activeCollections || 0);
+            });
+
+            tbody.innerHTML = collectors.map(collector => {
+                const isOnline = (Date.now() - new Date(collector.lastHeartbeat).getTime()) < 30000;
+                const statusBadge = collector.state === 'Collecting'
+                    ? '<span class="badge bg-warning">📥 Collecting</span>'
+                    : '<span class="badge bg-success">✓ Idle</span>';
+
+                const onlineBadge = isOnline
+                    ? '<span class="badge bg-success ms-1">Online</span>'
+                    : '<span class="badge bg-danger ms-1">Offline</span>';
+
+                const cpuScore = collector.cpuUsage || 0;
+                const memoryScore = ((collector.memoryUsageMB || 0) / 4096.0) * 100;
+
+                const collectionsDisplay = collector.activeCollections > 0
+                    ? `<span class="badge bg-primary">${collector.activeCollections} active</span>`
+                    : '<span class="text-muted">0</span>';
+
+                return `
+                        <tr class="${isOnline ? '' : 'table-secondary'}">
+                            <td>
+                                <code>${collector.collectorId}</code>
+                                ${onlineBadge}
+                            </td>
+                            <td>${statusBadge}</td>
+                            <td>${collectionsDisplay}</td>
+                            <td>
+                                <div class="progress" style="height: 20px; min-width: 80px;">
+                                    <div class="progress-bar ${cpuScore > 80 ? 'bg-danger' : cpuScore > 50 ? 'bg-warning' : 'bg-success'}"
+                                         role="progressbar"
+                                         style="width: ${cpuScore}%">
+                                        ${cpuScore.toFixed(1)}%
+                                    </div>
+                                </div>
+                            </td>
+                            <td>
+                                <div class="progress" style="height: 20px; min-width: 80px;">
+                                    <div class="progress-bar bg-info"
+                                         role="progressbar"
+                                         style="width: ${memoryScore}%">
+                                        ${collector.memoryUsageMB.toFixed(0)} MB
+                                    </div>
+                                </div>
+                            </td>
+                            <td>
+                                <small>${formatTimestamp(collector.lastHeartbeat)}</small>
+                            </td>
+                            <td>
+                                <span class="badge bg-success">${collector.totalCollected || 0}</span>
+                            </td>
+                            <td>
+                                <small>${collector.avgCollectionTimeMs || 0}ms</small>
                             </td>
                         </tr>
                     `;
@@ -563,35 +817,40 @@
         // Helper Functions
         function getStatusBadge(status) {
             const badges = {
-                'Completed': '<span class="badge bg-success">Completed</span>',
-                'Processing': '<span class="badge bg-primary">Processing</span>',
-                'Pending': '<span class="badge bg-warning">Pending</span>',
-                'Failed': '<span class="badge bg-danger">Failed</span>',
-                'Completed with Errors': '<span class="badge bg-warning">Completed with Errors</span>'
+                'Completed': '<span class="badge bg-success">✅ Completed</span>',
+                'Processing': '<span class="badge bg-primary">⚙️ Processing</span>',
+                'Pending': '<span class="badge bg-warning">⏳ Pending</span>',
+                'Failed': '<span class="badge bg-danger">❌ Failed</span>',
+                'Completed with Errors': '<span class="badge bg-warning">⚠️ Completed with Errors</span>'
             };
-            return badges[status] || '<span class="badge bg-secondary">Unknown</span>';
+            return badges[status] || `<span class="badge bg-secondary">❓ ${status}</span>`;
         }
 
         function getTaskStatusBadge(status) {
             const badges = {
-                'Completed': '<span class="badge bg-success">Completed</span>',
-                'Processing': '<span class="badge bg-primary">Processing</span>',
-                'Pending': '<span class="badge bg-secondary">Pending</span>',
-                'Failed': '<span class="badge bg-danger">Failed</span>'
+                'Pending': '<span class="badge bg-secondary">⏳ Pending</span>',
+                'Processing': '<span class="badge bg-primary">⚙️ Processing</span>',
+                'Processed': '<span class="badge bg-info">✓ Processed</span>',
+                'Collected': '<span class="badge bg-success">📦 Collected</span>',
+                'Completed': '<span class="badge bg-success">✅ Completed</span>',
+                'Failed': '<span class="badge bg-danger">❌ Failed</span>'
             };
-            return badges[status] || '<span class="badge bg-secondary">Unknown</span>';
+            return badges[status] || `<span class="badge bg-secondary">❓ ${status}</span>`;
         }
 
         function getProgressBar(progress, status) {
-            let progressBarClass = 'bg-primary';
+            let progressBarClass = 'bg-primary progress-animated';
             if (status === 'Completed') progressBarClass = 'bg-success';
-            if (status === 'Failed') progressBarClass = 'bg-danger';
+            if (status === 'Failed' || status === 'Completed with Errors') progressBarClass = 'bg-danger';
 
             return `
                     <div class="progress">
                         <div class="progress-bar ${progressBarClass}"
                              role="progressbar"
-                             style="width: ${progress}%">
+                             style="width: ${progress}%"
+                             aria-valuenow="${progress}"
+                             aria-valuemin="0"
+                             aria-valuemax="100">
                             ${progress}%
                         </div>
                     </div>
@@ -621,17 +880,18 @@
 
             const timestamp = new Date().toLocaleTimeString();
             const alertClass = `alert-${type}`;
+            const icon = type === 'success' ? '✅' : type === 'danger' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️';
 
             const logEntry = document.createElement('div');
-            logEntry.className = `alert ${alertClass} alert-dismissible fade show mb-2`;
+            logEntry.className = `alert ${alertClass} alert-dismissible fade show mb-2 log-entry`;
             logEntry.innerHTML = `
-                    <small>${timestamp}</small> ${message}
+                    <small><strong>${timestamp}</strong></small> ${icon} ${message}
                     <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                 `;
 
             logContainer.insertBefore(logEntry, logContainer.firstChild);
 
-            while (logContainer.children.length > 10) {
+            while (logContainer.children.length > 50) {
                 logContainer.removeChild(logContainer.lastChild);
             }
         }

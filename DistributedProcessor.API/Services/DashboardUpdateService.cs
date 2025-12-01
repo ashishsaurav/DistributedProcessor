@@ -23,7 +23,7 @@ namespace DistributedProcessor.API.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Dashboard Update Service started - Broadcasting every 2 seconds");
+            _logger.LogInformation("Dashboard Update Service started - Broadcasting every 500ms for real-time visibility");
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -32,23 +32,26 @@ namespace DistributedProcessor.API.Services
                     using var scope = _serviceProvider.CreateScope();
                     var dashboardService = scope.ServiceProvider.GetRequiredService<IDashboardService>();
                     var workerHealthService = scope.ServiceProvider.GetRequiredService<IWorkerHealthService>();
+                    var collectorHealthService = scope.ServiceProvider.GetRequiredService<ICollectorHealthService>(); // NEW
 
                     var jobs = await dashboardService.GetJobSummariesAsync();
                     var tasks = await dashboardService.GetTaskSummariesAsync();
                     var workers = await workerHealthService.GetAllWorkerStatusesAsync();
+                    var collectors = await collectorHealthService.GetAllCollectorStatusesAsync(); // NEW
 
                     await _hubContext.Clients.All.SendAsync("JobsUpdate", jobs, stoppingToken);
                     await _hubContext.Clients.All.SendAsync("TasksUpdate", tasks, stoppingToken);
                     await _hubContext.Clients.All.SendAsync("WorkersUpdate", workers, stoppingToken);
+                    await _hubContext.Clients.All.SendAsync("CollectorsUpdate", collectors, stoppingToken); // NEW
 
-                    _logger.LogDebug($"Broadcast: {jobs.Count} jobs, {tasks.Count} tasks, {workers.Count} workers");
+                    _logger.LogDebug($"Broadcast: {jobs.Count} jobs, {tasks.Count} tasks, {workers.Count} workers, {collectors.Count} collectors");
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error broadcasting dashboard updates");
                 }
 
-                await Task.Delay(2000, stoppingToken);
+                await Task.Delay(TimeSpan.FromMilliseconds(500), stoppingToken);
             }
         }
     }

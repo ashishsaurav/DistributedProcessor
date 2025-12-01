@@ -51,14 +51,13 @@ namespace DistributedProcessor.Data
                 entity.HasIndex(e => e.Status);
                 entity.HasIndex(e => e.Fund);
                 entity.HasIndex(e => e.SubmittedAt);
-
                 entity.Property(e => e.JobId).IsRequired().HasMaxLength(450);
                 entity.Property(e => e.Fund).IsRequired().HasMaxLength(100);
                 entity.Property(e => e.Status).IsRequired().HasMaxLength(50).HasDefaultValue("Pending");
                 entity.Property(e => e.CreatedBy).HasMaxLength(100);
             });
 
-            // Configure TaskLog
+            // Configure TaskLog with new fields
             modelBuilder.Entity<TaskLog>(entity =>
             {
                 entity.HasKey(e => e.Id);
@@ -67,7 +66,6 @@ namespace DistributedProcessor.Data
                 entity.HasIndex(e => e.Status);
                 entity.HasIndex(e => new { e.Fund, e.Symbol });
                 entity.HasIndex(e => e.WorkerId);
-
                 entity.Property(e => e.TaskId).IsRequired().HasMaxLength(450);
                 entity.Property(e => e.JobId).IsRequired().HasMaxLength(450);
                 entity.Property(e => e.Fund).HasMaxLength(100);
