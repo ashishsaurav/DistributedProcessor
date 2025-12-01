@@ -29,8 +29,7 @@ builder.Services.AddScoped<ISimpleJobOrchestrator, SimpleJobOrchestrator>();
 builder.Services.AddScoped<IDashboardService, DashboardService>();
 builder.Services.AddSingleton<ISmartTaskDispatcher, SmartTaskDispatcher>();
 builder.Services.AddHostedService<DashboardUpdateService>();
-
-
+builder.Services.AddHostedService<JobStatusUpdateService>();
 
 builder.Services.AddCors(options =>
 {

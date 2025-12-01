@@ -130,7 +130,7 @@ namespace DistributedProcessor.Worker.Services
                         {
                             _logger.LogInformation($"Worker {_workerId} processing task {task.TaskId} from partition {consumeResult.Partition.Value} ({task.Fund}/{task.Symbol}, {task.Rows.Count} rows)");
 
-                            await UpdateTaskStatusAsync(task.TaskId, "Processing", stoppingToken);
+                            await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
 
                             var stopwatch = Stopwatch.StartNew();
                             var calculatedRows = new List<CalculatedRow>();
@@ -162,7 +162,7 @@ namespace DistributedProcessor.Worker.Services
 
                             stopwatch.Stop();
 
-                            await UpdateTaskStatusAsync(task.TaskId, "Completed", stoppingToken);
+                            await UpdateTaskStatusAsync(task.TaskId, "Completed", _workerId, stoppingToken, calculatedRows.Count);
 
                             var result = new ProcessingResult
                             {
@@ -193,7 +193,7 @@ namespace DistributedProcessor.Worker.Services
 
                             if (task != null)
                             {
-                                await UpdateTaskStatusAsync(task.TaskId, "Failed", stoppingToken);
+                                await UpdateTaskStatusAsync(task.TaskId, "Failed", _workerId, stoppingToken);
 
                                 var failureResult = new ProcessingResult
                                 {
@@ -245,22 +245,32 @@ namespace DistributedProcessor.Worker.Services
             }
         }
 
-        private async Task UpdateTaskStatusAsync(string taskId, string status, CancellationToken stoppingToken)
+        private async Task UpdateTaskStatusAsync(string taskId, string status, string workerId = null, CancellationToken stoppingToken = default, int rowCount = 0)
         {
             try
             {
-                await _httpClient.PostAsJsonAsync("/api/task/update-status", new
+                var updateData = new
                 {
                     taskId = taskId,
                     status = status,
-                    workerId = _workerId
-                }, stoppingToken);
+                    workerId = workerId ?? _workerId,
+                    rowCount = rowCount
+                };
 
-                _logger.LogDebug($"Updated task {taskId} status to {status}");
+                var response = await _httpClient.PutAsJsonAsync($"/api/task/update-status", updateData, stoppingToken);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    _logger.LogDebug($"Task {taskId} status updated to {status}");
+                }
+                else
+                {
+                    _logger.LogWarning($"Failed to update task {taskId} status: {response.StatusCode}");
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, $"Failed to update task status for {taskId}");
+                _logger.LogWarning(ex, $"Failed to update task {taskId} status to {status}");
             }
         }
 
@@ -270,16 +280,16 @@ namespace DistributedProcessor.Worker.Services
             {
                 try
                 {
-                    var cpuUsage = GetCpuUsage();
-                    var memoryUsage = GetMemoryUsage();
+                    // Determine current state based on active tasks
+                    string currentState = _activeTasks > 0 ? "Busy" : "Idle";
 
                     var status = new WorkerStatus
                     {
                         WorkerId = _workerId,
-                        State = _activeTasks > 0 ? "Busy" : "Idle",
+                        State = currentState,
                         ActiveTasks = _activeTasks,
-                        CpuUsage = cpuUsage,
-                        MemoryUsageMB = memoryUsage,
+                        CpuUsage = GetCpuUsage(),
+                        MemoryUsageMB = GetMemoryUsage(),
                         LastHeartbeat = DateTime.UtcNow
                     };
 
@@ -287,16 +297,12 @@ namespace DistributedProcessor.Worker.Services
 
                     if (response.IsSuccessStatusCode)
                     {
-                        _logger.LogDebug($"Heartbeat sent: CPU={cpuUsage:F2}%, Memory={memoryUsage:F2}MB, Tasks={_activeTasks}");
-                    }
-                    else
-                    {
-                        _logger.LogWarning($"Heartbeat failed: {response.StatusCode}");
+                        _logger.LogDebug($"Heartbeat: State={currentState}, Tasks={_activeTasks}, CPU={status.CpuUsage:F1}%, Mem={status.MemoryUsageMB:F0}MB");
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error sending heartbeat");
+                    _logger.LogWarning(ex, "Failed to send heartbeat");
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);

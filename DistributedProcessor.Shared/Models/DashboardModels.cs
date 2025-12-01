@@ -25,13 +25,13 @@
 
     public class TaskSummary
     {
-        public string TaskId { get; set; }
-        public string JobId { get; set; }
-        public string Fund { get; set; }
-        public string Symbol { get; set; }
-        public string Status { get; set; } // Pending, Assigned, Processing, Completed, Failed
-        public string AssignedWorkerId { get; set; }
-        public int RowCount { get; set; }
+        public string TaskId { get; set; } = string.Empty;
+        public string JobId { get; set; } = string.Empty;
+        public string Fund { get; set; } = string.Empty;
+        public string Symbol { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public string? WorkerId { get; set; }
+        public int RowsProcessed { get; set; }
         public DateTime? StartedAt { get; set; }
         public DateTime? CompletedAt { get; set; }
     }

@@ -393,10 +393,16 @@
         // Update Metrics
         function updateMetrics() {
             const workers = Array.from(workersMap.values());
-            const totalWorkers = workers.length;
-            const idleWorkers = workers.filter(w => w.state === 'Idle').length;
-            const busyWorkers = workers.filter(w => w.state === 'Busy').length;
-            const totalActiveTasks = workers.reduce((sum, w) => sum + (w.activeTasks || 0), 0);
+            const now = Date.now();
+
+            const onlineWorkers = workers.filter(w =>
+                (now - new Date(w.lastHeartbeat).getTime()) < 30000
+            );
+
+            const totalWorkers = onlineWorkers.length;
+            const idleWorkers = onlineWorkers.filter(w => w.state === 'Idle').length;
+            const busyWorkers = onlineWorkers.filter(w => w.state === 'Busy').length;
+            const totalActiveTasks = onlineWorkers.reduce((sum, w) => sum + (w.activeTasks || 0), 0);
 
             document.getElementById('totalWorkers').textContent = totalWorkers;
             document.getElementById('idleWorkers').textContent = idleWorkers;
@@ -455,20 +461,26 @@
             tbody.innerHTML = recentTasks.map(task => {
                 const statusBadge = getTaskStatusBadge(task.status);
 
+                // ✅ Show worker ID or dash
+                const workerDisplay = task.workerId
+                    ? `<small><code>${task.workerId}</code></small>`
+                    : '<span class="text-muted">-</span>';
+
                 return `
-                        <tr>
-                            <td><code>${task.taskId.substring(0, 8)}</code></td>
-                            <td><code>${task.jobId.substring(0, 8)}</code></td>
-                            <td>${task.fund}/${task.symbol}</td>
-                            <td>${statusBadge}</td>
-                            <td><small>${task.workerId || '-'}</small></td>
-                            <td>${task.rowsProcessed || 0}</td>
-                            <td><small>${formatTimestamp(task.startedAt)}</small></td>
-                            <td><small>${task.completedAt ? formatTimestamp(task.completedAt) : '-'}</small></td>
-                        </tr>
-                    `;
+            <tr>
+                <td><code>${task.taskId.substring(0, 8)}</code></td>
+                <td><code>${task.jobId.substring(0, 8)}</code></td>
+                <td>${task.fund}/${task.symbol}</td>
+                <td>${statusBadge}</td>
+                <td>${workerDisplay}</td>
+                <td>${task.rowsProcessed || 0}</td>
+                <td><small>${formatTimestamp(task.startedAt)}</small></td>
+                <td><small>${task.completedAt ? formatTimestamp(task.completedAt) : '-'}</small></td>
+            </tr>
+        `;
             }).join('');
         }
+
 
         // Update Workers Table
         function updateWorkersTable() {

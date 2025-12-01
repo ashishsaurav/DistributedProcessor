@@ -128,7 +128,9 @@ namespace DistributedProcessor.API.Services
             var query = _context.TaskLogs.AsQueryable();
 
             if (!string.IsNullOrEmpty(jobId))
+            {
                 query = query.Where(t => t.JobId == jobId);
+            }
 
             var tasks = await query
                 .OrderByDescending(t => t.CreatedAt)
@@ -137,11 +139,11 @@ namespace DistributedProcessor.API.Services
                 {
                     TaskId = t.TaskId,
                     JobId = t.JobId,
-                    Fund = t.Fund,
-                    Symbol = t.Symbol,
+                    Fund = t.Fund ?? "",
+                    Symbol = t.Symbol ?? "",
                     Status = t.Status,
-                    AssignedWorkerId = t.WorkerId,
-                    RowCount = t.RowsProcessed ?? 0,
+                    WorkerId = t.WorkerId,
+                    RowsProcessed = t.RowsProcessed ?? 0,
                     StartedAt = t.StartedAt,
                     CompletedAt = t.CompletedAt
                 })
@@ -149,6 +151,7 @@ namespace DistributedProcessor.API.Services
 
             return tasks;
         }
+
 
         public async Task<CollectorStats> GetCollectorStatsAsync()
         {
