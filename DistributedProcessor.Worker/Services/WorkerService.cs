@@ -45,12 +45,22 @@ namespace DistributedProcessor.Worker.Services
                 BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "localhost:5081",
                 GroupId = "worker-group",
                 AutoOffsetReset = AutoOffsetReset.Earliest,
-                EnableAutoCommit = false
+                EnableAutoCommit = false, //  Manual commit for reliability
+
+                //  NEW: Faster crash detection
+                SessionTimeoutMs = 10000,        // 10 seconds - faster rebalance
+                MaxPollIntervalMs = 300000,      // 5 minutes max between polls
+                HeartbeatIntervalMs = 3000       // Send heartbeat every 3 seconds
             };
 
             var producerConfig = new ProducerConfig
             {
-                BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "localhost:5081"
+                BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "localhost:5081",
+
+                //  NEW: Ensure messages are not lost
+                Acks = Acks.All,                 // Wait for all replicas
+                MessageSendMaxRetries = 3,       // Retry failed sends
+                EnableIdempotence = true         // Prevent duplicate messages
             };
 
             _taskConsumer = new ConsumerBuilder<string, string>(consumerConfig).Build();
@@ -102,111 +112,138 @@ namespace DistributedProcessor.Worker.Services
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    ConsumeResult<string, string> consumeResult = null;
                     ProcessingTask task = null;
                     Stopwatch taskStopwatch = null;
 
                     try
                     {
-                        var consumeResult = _taskConsumer.Consume(stoppingToken);
+                        consumeResult = _taskConsumer.Consume(stoppingToken);
+
                         if (consumeResult == null || consumeResult.IsPartitionEOF)
                         {
                             continue;
                         }
 
                         task = JsonSerializer.Deserialize<ProcessingTask>(consumeResult.Message.Value);
+
                         if (task == null)
                         {
                             _logger.LogWarning("Received null task, skipping");
-                            _taskConsumer.Commit(consumeResult);
+                            _taskConsumer.Commit(consumeResult); //  Commit even if null
                             continue;
                         }
 
                         // IMMEDIATE STATUS UPDATE: Task starting
                         Interlocked.Increment(ref _activeTasks);
-                        await SendImmediateHeartbeatAsync(stoppingToken); // NEW: Instant update
+                        await SendImmediateHeartbeatAsync(stoppingToken);
 
                         taskStopwatch = Stopwatch.StartNew();
 
-                        try
+                        _logger.LogInformation(
+                            $"Worker {_workerId} processing task {task.TaskId} from partition {consumeResult.Partition.Value} " +
+                            $"({task.Fund}/{task.Symbol}, {task.Rows.Count} rows)");
+
+                        // Update to Processing status
+                        await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
+
+                        // Process the task
+                        var calculatedRows = new List<CalculatedRow>();
+                        decimal previousValue = 0;
+                        decimal cumulativeReturns = 0;
+
+                        foreach (var row in task.Rows.OrderBy(r => r.Date))
                         {
-                            _logger.LogInformation($"Worker {_workerId} processing task {task.TaskId} from partition {consumeResult.Partition.Value} ({task.Fund}/{task.Symbol}, {task.Rows.Count} rows)");
-
-                            // Update to Processing status
-                            await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
-
-                            // Process the task
-                            var calculatedRows = new List<CalculatedRow>();
-                            decimal previousValue = 0;
-                            decimal cumulativeReturns = 0;
-
-                            foreach (var row in task.Rows.OrderBy(r => r.Date))
+                            decimal returns = 0;
+                            if (previousValue > 0)
                             {
-                                decimal returns = 0;
-                                if (previousValue > 0)
-                                {
-                                    returns = (row.Value - previousValue) / previousValue;
-                                    cumulativeReturns = (1 + cumulativeReturns) * (1 + returns) - 1;
-                                }
-
-                                var calculated = new CalculatedRow
-                                {
-                                    Date = row.Date,
-                                    Price = row.Value,
-                                    Returns = returns,
-                                    CumulativeReturns = cumulativeReturns
-                                };
-
-                                calculatedRows.Add(calculated);
-                                previousValue = row.Value;
+                                returns = (row.Value - previousValue) / previousValue;
+                                cumulativeReturns = (1 + cumulativeReturns) * (1 + returns) - 1;
                             }
 
-                            _logger.LogInformation($"Worker {_workerId} simulating 5-second processing delay for task {task.TaskId}");
-                            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-
-                            taskStopwatch.Stop();
-
-                            // Update to Processed status (worker finished, before sending to Kafka)
-                            await UpdateTaskStatusAsync(
-                                task.TaskId,
-                                "Processed",
-                                _workerId,
-                                stoppingToken,
-                                calculatedRows.Count,
-                                taskStopwatch.ElapsedMilliseconds);
-
-                            // Create and publish result
-                            var result = new ProcessingResult
+                            var calculated = new CalculatedRow
                             {
-                                TaskId = task.TaskId,
-                                JobId = task.JobId,
-                                WorkerId = _workerId,
-                                Fund = task.Fund,
-                                Symbol = task.Symbol,
-                                CalculatedRows = calculatedRows,
-                                ProcessedAt = DateTime.UtcNow,
-                                Success = true,
-                                ProcessingDurationMs = taskStopwatch.ElapsedMilliseconds
+                                Date = row.Date,
+                                Price = row.Value,
+                                Returns = returns,
+                                CumulativeReturns = cumulativeReturns
                             };
 
-                            var message = new Message<string, string>
-                            {
-                                Key = task.JobId,
-                                Value = JsonSerializer.Serialize(result)
-                            };
-
-                            await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
-                            _taskConsumer.Commit(consumeResult);
-
-                            Interlocked.Increment(ref _totalProcessed);
-                            _logger.LogInformation($"Worker {_workerId} completed task {task.TaskId} in {taskStopwatch.ElapsedMilliseconds}ms ({calculatedRows.Count} rows)");
+                            calculatedRows.Add(calculated);
+                            previousValue = row.Value;
                         }
-                        catch (Exception taskEx)
-                        {
-                            taskStopwatch?.Stop();
-                            _logger.LogError(taskEx, $"Error processing task {task?.TaskId}");
 
-                            if (task != null)
+                        _logger.LogInformation($"Worker {_workerId} simulating 5-second processing delay for task {task.TaskId}");
+                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+
+                        taskStopwatch.Stop();
+
+                        // Update to Processed status (worker finished, before sending to Kafka)
+                        await UpdateTaskStatusAsync(
+                            task.TaskId,
+                            "Processed",
+                            _workerId,
+                            stoppingToken,
+                            calculatedRows.Count,
+                            taskStopwatch.ElapsedMilliseconds);
+
+                        // Create and publish result
+                        var result = new ProcessingResult
+                        {
+                            TaskId = task.TaskId,
+                            JobId = task.JobId,
+                            WorkerId = _workerId,
+                            Fund = task.Fund,
+                            Symbol = task.Symbol,
+                            CalculatedRows = calculatedRows,
+                            ProcessedAt = DateTime.UtcNow,
+                            Success = true,
+                            ProcessingDurationMs = taskStopwatch.ElapsedMilliseconds
+                        };
+
+                        var message = new Message<string, string>
+                        {
+                            Key = task.JobId,
+                            Value = JsonSerializer.Serialize(result)
+                        };
+
+                        //  CRITICAL: Publish result to Kafka
+                        var deliveryResult = await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
+
+                        _logger.LogInformation(
+                            $"Result published to {ResultTopic} at offset {deliveryResult.Offset} for task {task.TaskId}");
+
+                        //  CRITICAL: Commit ONLY after successful publish
+                        _taskConsumer.Commit(consumeResult);
+
+                        _logger.LogInformation($"Task {task.TaskId} committed to Kafka (offset {consumeResult.Offset})");
+
+                        Interlocked.Increment(ref _totalProcessed);
+
+                        _logger.LogInformation(
+                            $"Worker {_workerId} completed task {task.TaskId} in {taskStopwatch.ElapsedMilliseconds}ms " +
+                            $"({calculatedRows.Count} rows)");
+                    }
+                    catch (ConsumeException cex)
+                    {
+                        _logger.LogError(cex, $"Kafka consume error: {cex.Error.Reason}");
+                        // Don't commit on consume error - let Kafka retry
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogInformation("Worker shutting down gracefully");
+                        break;
+                    }
+                    catch (Exception taskEx)
+                    {
+                        taskStopwatch?.Stop();
+                        _logger.LogError(taskEx, $"Error processing task {task?.TaskId}");
+
+                        if (task != null && consumeResult != null)
+                        {
+                            try
                             {
+                                // Update task status to Failed
                                 await UpdateTaskStatusAsync(
                                     task.TaskId,
                                     "Failed",
@@ -216,6 +253,7 @@ namespace DistributedProcessor.Worker.Services
                                     taskStopwatch?.ElapsedMilliseconds ?? 0,
                                     taskEx.Message);
 
+                                // Publish failure result
                                 var failureResult = new ProcessingResult
                                 {
                                     TaskId = task.TaskId,
@@ -236,33 +274,31 @@ namespace DistributedProcessor.Worker.Services
                                 };
 
                                 await _resultProducer.ProduceAsync(ResultTopic, failureMessage, stoppingToken);
+
+                                // Commit even if failed - don't reprocess failed tasks indefinitely
                                 _taskConsumer.Commit(consumeResult);
+
+                                _logger.LogWarning($"Failed task {task.TaskId} committed to prevent reprocessing");
+                            }
+                            catch (Exception commitEx)
+                            {
+                                _logger.LogError(commitEx, $"Failed to handle task failure for {task.TaskId}");
+                                // Don't commit - task will be retried
                             }
                         }
-                        finally
-                        {
-                            // IMMEDIATE STATUS UPDATE: Task ended
-                            Interlocked.Decrement(ref _activeTasks);
-                            await SendImmediateHeartbeatAsync(stoppingToken); // NEW: Instant update
-                        }
                     }
-                    catch (ConsumeException cex)
+                    finally
                     {
-                        _logger.LogError(cex, $"Kafka consume error: {cex.Error.Reason}");
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        _logger.LogInformation("Worker shutting down");
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Unexpected error in consumer loop");
+                        // IMMEDIATE STATUS UPDATE: Task ended
+                        Interlocked.Decrement(ref _activeTasks);
+                        await SendImmediateHeartbeatAsync(stoppingToken);
                     }
                 }
             }
             finally
             {
+                _logger.LogInformation($"Worker {_workerId} shutting down, flushing producer...");
+                _resultProducer.Flush(TimeSpan.FromSeconds(10)); //  Ensure all messages sent
                 _taskConsumer.Close();
                 _resultProducer.Dispose();
                 _logger.LogInformation($"Worker {_workerId} stopped");
@@ -270,13 +306,13 @@ namespace DistributedProcessor.Worker.Services
         }
 
         private async Task UpdateTaskStatusAsync(
-    string taskId,
-    string status,
-    string workerId = null,
-    CancellationToken stoppingToken = default,
-    int rowCount = 0,
-    long durationMs = 0,
-    string errorMessage = null)
+            string taskId,
+            string status,
+            string workerId = null,
+            CancellationToken stoppingToken = default,
+            int rowCount = 0,
+            long durationMs = 0,
+            string errorMessage = null)
         {
             try
             {
@@ -313,6 +349,7 @@ namespace DistributedProcessor.Worker.Services
             try
             {
                 string currentState = _activeTasks > 0 ? "Busy" : "Idle";
+
                 var status = new WorkerStatus
                 {
                     WorkerId = _workerId,
@@ -340,6 +377,7 @@ namespace DistributedProcessor.Worker.Services
                 try
                 {
                     string currentState = _activeTasks > 0 ? "Busy" : "Idle";
+
                     var status = new WorkerStatus
                     {
                         WorkerId = _workerId,
@@ -355,7 +393,9 @@ namespace DistributedProcessor.Worker.Services
 
                     if (response.IsSuccessStatusCode)
                     {
-                        _logger.LogDebug($"Heartbeat: State={currentState}, Tasks={_activeTasks}, CPU={status.CpuUsage:F1}%, Mem={status.MemoryUsageMB:F0}MB");
+                        _logger.LogDebug(
+                            $"Heartbeat: State={currentState}, Tasks={_activeTasks}, " +
+                            $"CPU={status.CpuUsage:F1}%, Mem={status.MemoryUsageMB:F0}MB");
                     }
                 }
                 catch (Exception ex)
@@ -363,7 +403,6 @@ namespace DistributedProcessor.Worker.Services
                     _logger.LogWarning(ex, "Failed to send heartbeat");
                 }
 
-                // Reduced from 5 seconds to 1 second
                 await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
             }
         }

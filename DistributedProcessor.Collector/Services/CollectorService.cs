@@ -44,7 +44,12 @@ namespace DistributedProcessor.Collector.Services
                 BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "localhost:5081",
                 GroupId = "collector-group",
                 AutoOffsetReset = AutoOffsetReset.Earliest,
-                EnableAutoCommit = false
+                EnableAutoCommit = false, //  Manual commit for reliability
+
+                //  NEW: Faster crash detection
+                SessionTimeoutMs = 10000,
+                MaxPollIntervalMs = 300000,
+                HeartbeatIntervalMs = 3000
             };
 
             _consumer = new ConsumerBuilder<string, string>(consumerConfig).Build();
@@ -87,9 +92,13 @@ namespace DistributedProcessor.Collector.Services
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    ConsumeResult<string, string> consumeResult = null;
+                    ProcessingResult result = null;
+                    Stopwatch collectionStopwatch = null;
+
                     try
                     {
-                        var consumeResult = _consumer.Consume(stoppingToken);
+                        consumeResult = _consumer.Consume(stoppingToken);
 
                         if (consumeResult?.Message?.Value == null)
                         {
@@ -99,12 +108,12 @@ namespace DistributedProcessor.Collector.Services
 
                         _logger.LogInformation($"Consumed message at offset {consumeResult.Offset}");
 
-                        var result = JsonSerializer.Deserialize<ProcessingResult>(consumeResult.Message.Value);
+                        result = JsonSerializer.Deserialize<ProcessingResult>(consumeResult.Message.Value);
 
                         if (result == null)
                         {
                             _logger.LogWarning("Deserialized ProcessingResult is null");
-                            _consumer.Commit(consumeResult);
+                            _consumer.Commit(consumeResult); //  Commit even if null
                             continue;
                         }
 
@@ -113,17 +122,18 @@ namespace DistributedProcessor.Collector.Services
                         await SendImmediateHeartbeatAsync(stoppingToken);
 
                         // Simulate collection delay for testing
-                        _logger.LogInformation($"Collector {_collectorId} simulating 5-second delay before saving TaskId: {result.TaskId}");
+                        _logger.LogInformation(
+                            $"Collector {_collectorId} simulating 5-second delay before saving TaskId: {result.TaskId}");
                         await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
-                        var collectionStopwatch = Stopwatch.StartNew();
+                        collectionStopwatch = Stopwatch.StartNew();
 
                         using var scope = _scopeFactory.CreateScope();
                         var dbService = scope.ServiceProvider.GetRequiredService<IDbService>();
 
                         _logger.LogInformation($"Saving results for TaskId: {result.TaskId}");
 
-                        // Save to database
+                        //  CRITICAL: Save to database
                         await dbService.SaveCalculatedResultsAsync(result);
 
                         collectionStopwatch.Stop();
@@ -136,17 +146,56 @@ namespace DistributedProcessor.Collector.Services
                             collectionStopwatch.ElapsedMilliseconds,
                             stoppingToken);
 
-                        _logger.LogInformation($"Results saved and collected for TaskId: {result.TaskId} in {collectionStopwatch.ElapsedMilliseconds}ms");
+                        _logger.LogInformation(
+                            $"Results saved and collected for TaskId: {result.TaskId} in {collectionStopwatch.ElapsedMilliseconds}ms");
+
+                        //  CRITICAL: Commit ONLY after successful database save
+                        _consumer.Commit(consumeResult);
+
+                        _logger.LogInformation($" Collection committed to Kafka (offset {consumeResult.Offset})");
 
                         // Update metrics
                         Interlocked.Increment(ref _totalCollected);
                         Interlocked.Add(ref _totalCollectionTimeMs, collectionStopwatch.ElapsedMilliseconds);
-
-                        _consumer.Commit(consumeResult);
+                    }
+                    catch (ConsumeException cex)
+                    {
+                        _logger.LogError(cex, $"Kafka consume error: {cex.Error.Reason}");
+                        //  Don't commit on consume error
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogInformation("CollectorService stopping gracefully");
+                        break;
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error in CollectorService");
+                        collectionStopwatch?.Stop();
+                        _logger.LogError(ex, $"Error collecting results for task {result?.TaskId}");
+
+                        if (result != null && consumeResult != null)
+                        {
+                            try
+                            {
+                                // Mark task as failed collection
+                                await UpdateTaskStatusAsync(
+                                    result.TaskId,
+                                    "Failed",
+                                    result.WorkerId,
+                                    collectionStopwatch?.ElapsedMilliseconds ?? 0,
+                                    stoppingToken);
+
+                                //  Commit to prevent infinite retry
+                                _consumer.Commit(consumeResult);
+
+                                _logger.LogWarning($"Failed collection for {result.TaskId} committed to prevent reprocessing");
+                            }
+                            catch (Exception commitEx)
+                            {
+                                _logger.LogError(commitEx, $"Failed to handle collection error for {result?.TaskId}");
+                                //  Don't commit - collection will be retried
+                            }
+                        }
                     }
                     finally
                     {
@@ -155,10 +204,6 @@ namespace DistributedProcessor.Collector.Services
                         await SendImmediateHeartbeatAsync(stoppingToken);
                     }
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogInformation("CollectorService stopping");
             }
             finally
             {
