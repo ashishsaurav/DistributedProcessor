@@ -36,6 +36,9 @@ builder.Services.AddScoped<IDeadLetterService, DeadLetterService>();
 builder.Services.AddScoped<IIdempotencyService, IdempotencyService>();
 builder.Services.AddHostedService<IdempotencyCleanupService>();
 builder.Services.AddSingleton<ICircuitBreakerFactory, CircuitBreakerFactory>();
+builder.Services.AddScoped<IOutboxService, OutboxService>();
+builder.Services.AddHostedService<OutboxPublisherService>();
+builder.Services.AddHostedService<OutboxCleanupService>();
 
 builder.Services.AddCors(options =>
 {

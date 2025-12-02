@@ -17,6 +17,7 @@ namespace DistributedProcessor.Data
         public DbSet<TaskLog> TaskLogs { get; set; }
         public DbSet<DeadLetterMessage> DeadLetterMessages { get; set; }
         public DbSet<IdempotencyKey> IdempotencyKeys { get; set; }
+        public DbSet<OutboxMessage> OutboxMessages { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -101,6 +102,21 @@ namespace DistributedProcessor.Data
                 entity.Property(e => e.TaskId).IsRequired().HasMaxLength(450);
                 entity.Property(e => e.Status).IsRequired().HasMaxLength(50);
                 entity.Property(e => e.WorkerId).HasMaxLength(255);
+            });
+
+            modelBuilder.Entity<OutboxMessage>(entity =>
+            {
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.MessageId).IsUnique();
+                entity.HasIndex(e => new { e.Status, e.CreatedAt });
+
+                entity.Property(e => e.MessageId).IsRequired().HasMaxLength(450);
+                entity.Property(e => e.Topic).IsRequired().HasMaxLength(255);
+                entity.Property(e => e.MessageKey).HasMaxLength(450);
+                entity.Property(e => e.Payload).IsRequired();
+                entity.Property(e => e.MessageType).IsRequired().HasMaxLength(255);
+                entity.Property(e => e.Status).IsRequired().HasMaxLength(50);
+                entity.Property(e => e.ErrorMessage).HasMaxLength(2000);
             });
         }
     }

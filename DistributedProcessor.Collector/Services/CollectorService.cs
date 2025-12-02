@@ -13,6 +13,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using DistributedProcessor.Data.Models;
+using DistributedProcessor.Data;
 
 namespace DistributedProcessor.Collector.Services
 {
@@ -158,32 +160,73 @@ namespace DistributedProcessor.Collector.Services
         }
 
         private async Task ProcessCollectionAsync(
-        ProcessingResult result,
-        ConsumeResult<string, string> consumeResult,
-        CancellationToken cancellationToken)
+            ProcessingResult result,
+            ConsumeResult<string, string> consumeResult,
+            CancellationToken cancellationToken)
         {
             try
             {
                 using var scope = _scopeFactory.CreateScope();
                 var dbService = scope.ServiceProvider.GetRequiredService<IDbService>();
+                var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
                 _logger.LogInformation("Saving results for TaskId {TaskId}", result.TaskId);
 
-                await dbService.SaveCalculatedResultsAsync(result);
+                // START TRANSACTION
+                using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
 
-                await UpdateTaskStatusAsync(result.TaskId, "Collected", cancellationToken);
+                try
+                {
+                    // 1. Save calculated results to database
+                    await dbService.SaveCalculatedResultsAsync(result);
 
-                _consumer.Commit(consumeResult);
+                    // 2. Add status update to outbox (instead of direct API call)
+                    var statusUpdate = new
+                    {
+                        taskId = result.TaskId,
+                        status = "Collected",
+                        workerId = _collectorId,
+                        rowCount = result.CalculatedRows?.Count ?? 0
+                    };
 
-                _logger.LogInformation("Collection completed for TaskId {TaskId}", result.TaskId);
+                    var outboxMessage = new OutboxMessage
+                    {
+                        MessageId = Guid.NewGuid().ToString(),
+                        Topic = "task-status-updates", // Virtual topic for status updates
+                        MessageKey = result.TaskId,
+                        Payload = JsonSerializer.Serialize(statusUpdate),
+                        MessageType = "TaskStatusUpdate",
+                        CreatedAt = DateTime.UtcNow,
+                        Status = "Pending"
+                    };
+
+                    context.OutboxMessages.Add(outboxMessage);
+
+                    // 3. Save everything atomically
+                    await context.SaveChangesAsync(cancellationToken);
+
+                    // 4. Commit transaction
+                    await transaction.CommitAsync(cancellationToken);
+
+                    // 5. Now commit Kafka offset (after DB transaction succeeds)
+                    _consumer.Commit(consumeResult);
+
+                    _logger.LogInformation(
+                        "Collection completed for TaskId {TaskId} with transactional guarantee",
+                        result.TaskId);
+                }
+                catch (Exception ex)
+                {
+                    await transaction.RollbackAsync(cancellationToken);
+                    throw;
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error collecting results for task {TaskId}", result.TaskId);
 
-                await UpdateTaskStatusAsync(result.TaskId, "Failed", cancellationToken);
-
-                _consumer.Commit(consumeResult); // Commit to prevent retry
+                // Only commit offset if we want to skip this message
+                _consumer.Commit(consumeResult);
             }
         }
 
