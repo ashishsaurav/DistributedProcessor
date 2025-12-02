@@ -15,6 +15,7 @@ namespace DistributedProcessor.Data
         public DbSet<CalculatedResult> CalculatedResults { get; set; }
         public DbSet<JobExecution> JobExecutions { get; set; }
         public DbSet<TaskLog> TaskLogs { get; set; }
+        public DbSet<DeadLetterMessage> DeadLetterMessages { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -79,6 +80,15 @@ namespace DistributedProcessor.Data
                     .HasForeignKey(t => t.JobId)
                     .HasPrincipalKey(j => j.JobId)
                     .OnDelete(DeleteBehavior.Cascade);
+            });
+
+            // Configure DeadLetterMessage
+            modelBuilder.Entity<DeadLetterMessage>(entity =>
+            {
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.MessageId);
+                entity.HasIndex(e => e.Status);
+                entity.HasIndex(e => e.JobId);
             });
         }
     }

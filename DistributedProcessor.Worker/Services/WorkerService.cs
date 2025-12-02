@@ -4,7 +4,9 @@ using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,6 +29,9 @@ namespace DistributedProcessor.Worker.Services
         private int _totalProcessed = 0;
         private const string TaskTopic = "processing-tasks";
         private const string ResultTopic = "processing-results";
+        private const int MAX_RETRIES = 3;
+        private const int BASE_DELAY_MS = 1000; // Start with 1 second
+        private const int MAX_DELAY_MS = 30000; // Cap at 30 seconds
 
         // CPU and Memory monitoring
         private PerformanceCounter _cpuCounter;
@@ -237,12 +242,30 @@ namespace DistributedProcessor.Worker.Services
                     catch (Exception taskEx)
                     {
                         taskStopwatch?.Stop();
-                        _logger.LogError(taskEx, $"Error processing task {task?.TaskId}");
+                        _logger.LogError(taskEx, "Error processing task {TaskId}", task?.TaskId);
 
                         if (task != null && consumeResult != null)
                         {
                             try
                             {
+                                // Get retry count from headers
+                                int retryCount = GetRetryCount(consumeResult.Message.Headers);
+
+                                if (retryCount < MAX_RETRIES && IsTransientError(taskEx))
+                                {
+                                    // Transient error - don't commit, let Kafka retry
+                                    _logger.LogWarning(
+                                        "Transient error for task {TaskId}, attempt {Retry}/{Max}. Will retry.",
+                                        task.TaskId, retryCount + 1, MAX_RETRIES);
+
+                                    // Wait before next retry
+                                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryCount + 1)));
+                                    continue; // Don't commit, Kafka will redeliver
+                                }
+
+                                // Max retries reached or permanent error - send to DLQ
+                                await SendToDlqAsync(task, taskEx, retryCount);
+
                                 // Update task status to Failed
                                 await UpdateTaskStatusAsync(
                                     task.TaskId,
@@ -251,46 +274,21 @@ namespace DistributedProcessor.Worker.Services
                                     stoppingToken,
                                     0,
                                     taskStopwatch?.ElapsedMilliseconds ?? 0,
-                                    taskEx.Message);
+                                    $"Sent to DLQ: {taskEx.Message}");
 
-                                // Publish failure result
-                                var failureResult = new ProcessingResult
-                                {
-                                    TaskId = task.TaskId,
-                                    JobId = task.JobId,
-                                    WorkerId = _workerId,
-                                    Fund = task.Fund,
-                                    Symbol = task.Symbol,
-                                    Success = false,
-                                    ErrorMessage = taskEx.Message,
-                                    ProcessedAt = DateTime.UtcNow,
-                                    ProcessingDurationMs = taskStopwatch?.ElapsedMilliseconds ?? 0
-                                };
-
-                                var failureMessage = new Message<string, string>
-                                {
-                                    Key = task.JobId,
-                                    Value = JsonSerializer.Serialize(failureResult)
-                                };
-
-                                await _resultProducer.ProduceAsync(ResultTopic, failureMessage, stoppingToken);
-
-                                // Commit even if failed - don't reprocess failed tasks indefinitely
+                                // Commit to prevent reprocessing
                                 _taskConsumer.Commit(consumeResult);
-
-                                _logger.LogWarning($"Failed task {task.TaskId} committed to prevent reprocessing");
                             }
                             catch (Exception commitEx)
                             {
-                                _logger.LogError(commitEx, $"Failed to handle task failure for {task.TaskId}");
-                                // Don't commit - task will be retried
+                                _logger.LogError(commitEx, "Failed to handle task failure for {TaskId}", task.TaskId);
                             }
                         }
                     }
                     finally
                     {
-                        // IMMEDIATE STATUS UPDATE: Task ended
-                        Interlocked.Decrement(ref _activeTasks);
+                        if (_activeTasks > 0)
+                            Interlocked.Decrement(ref _activeTasks);
                         await SendImmediateHeartbeatAsync(stoppingToken);
                     }
                 }
@@ -302,6 +300,67 @@ namespace DistributedProcessor.Worker.Services
                 _taskConsumer.Close();
                 _resultProducer.Dispose();
                 _logger.LogInformation($"Worker {_workerId} stopped");
+            }
+        }
+
+        private int GetRetryCount(Headers? headers)
+        {
+            if (headers == null) return 0;
+
+            try
+            {
+                var header = headers.FirstOrDefault(h => h.Key == "retry-count");
+                if (header != null)
+                {
+                    var value = Encoding.UTF8.GetString(header.GetValueBytes());
+                    return int.TryParse(value, out var count) ? count : 0;
+                }
+            }
+            catch { }
+
+            return 0;
+        }
+
+        private bool IsTransientError(Exception ex)
+        {
+            return ex switch
+            {
+                HttpRequestException => true,
+                TimeoutException => true,
+                IOException => true,
+                SocketException => true,
+                _ => false
+            };
+        }
+
+        private async Task SendToDlqAsync(ProcessingTask task, Exception exception, int retryCount)
+        {
+            try
+            {
+                var dlqRequest = new
+                {
+                    message = task,
+                    topic = TaskTopic,
+                    errorMessage = exception.Message,
+                    exceptionType = exception.GetType().Name,
+                    retryCount = retryCount,
+                    workerId = _workerId,
+                    jobId = task.JobId,
+                    taskId = task.TaskId
+                };
+
+                var response = await _httpClient.PostAsJsonAsync(
+                    "api/deadletter/send",
+                    dlqRequest);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogError("Failed to send to DLQ: {StatusCode}", response.StatusCode);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Exception sending to DLQ for task {TaskId}", task.TaskId);
             }
         }
 

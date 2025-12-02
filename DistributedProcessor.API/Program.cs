@@ -2,6 +2,7 @@ using DistributedProcessor.API.Hubs;
 using DistributedProcessor.API.Services;
 using DistributedProcessor.Data;
 using DistributedProcessor.Data.Services;
+using DistributedProcessor.Shared.Services;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 
@@ -31,6 +32,7 @@ builder.Services.AddSingleton<ISmartTaskDispatcher, SmartTaskDispatcher>();
 builder.Services.AddHostedService<DashboardUpdateService>();
 builder.Services.AddHostedService<JobStatusUpdateService>();
 builder.Services.AddSingleton<ICollectorHealthService, CollectorHealthService>();
+builder.Services.AddScoped<IDeadLetterService, DeadLetterService>();
 
 
 builder.Services.AddCors(options =>
