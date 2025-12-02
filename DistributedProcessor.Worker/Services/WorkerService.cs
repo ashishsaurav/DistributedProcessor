@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using System.Xml;
 using Confluent.Kafka;
 using DistributedProcessor.Shared.Models;
+using DistributedProcessor.Shared.Services;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
@@ -29,6 +30,11 @@ namespace DistributedProcessor.Worker.Services
         private readonly string _workerId;
         private int _activeTasks = 0;
         private int _totalProcessed = 0;
+
+        // Circuit Breakers
+        private readonly ICircuitBreaker _apiCircuitBreaker;
+        private readonly ICircuitBreaker _kafkaCircuitBreaker;
+
         private const string TaskTopic = "processing-tasks";
         private const string ResultTopic = "processing-results";
         private const int MAX_RETRIES = 3;
@@ -41,11 +47,25 @@ namespace DistributedProcessor.Worker.Services
 
         public WorkerService(
             ILogger<WorkerService> logger,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            ILoggerFactory loggerFactory)
         {
             _logger = logger;
             _workerId = $"worker-{Guid.NewGuid().ToString()[..8]}";
             _currentProcess = Process.GetCurrentProcess();
+
+            // Initialize circuit breakers
+            _apiCircuitBreaker = new CircuitBreaker(
+                "API",
+                loggerFactory.CreateLogger<CircuitBreaker>(),
+                failureThreshold: 5,
+                openDurationSeconds: 30);
+
+            _kafkaCircuitBreaker = new CircuitBreaker(
+                "Kafka",
+                loggerFactory.CreateLogger<CircuitBreaker>(),
+                failureThreshold: 3,
+                openDurationSeconds: 60);
 
             var consumerConfig = new ConsumerConfig
             {
@@ -264,35 +284,36 @@ namespace DistributedProcessor.Worker.Services
             return false;
         }
 
-        // ADD THESE HELPER METHODS:
-
         private async Task<bool> CheckIdempotencyAsync(string taskId)
         {
             try
             {
-                var response = await _httpClient.GetAsync(
-                    $"api/idempotency/can-process/{taskId}?workerId={_workerId}",
-                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
-
-                if (response.IsSuccessStatusCode)
+                return await _apiCircuitBreaker.ExecuteAsync(async () =>
                 {
-                    var result = await response.Content.ReadFromJsonAsync<IdempotencyCheckResult>();
-                    return result?.CanProcess ?? true;
-                }
+                    var response = await _httpClient.GetAsync(
+                        $"api/idempotency/can-process/{taskId}?workerId={_workerId}",
+                        new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
 
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var result = await response.Content.ReadFromJsonAsync<IdempotencyCheckResult>();
+                        return result?.CanProcess ?? true;
+                    }
+
+                    return true;
+                });
+            }
+            catch (CircuitBreakerOpenException ex)
+            {
                 _logger.LogWarning(
-                    "Failed to check idempotency for {TaskId}: {StatusCode}. Allowing processing.",
-                    taskId, response.StatusCode);
-
-                return true; // Fail open
+                    "Circuit breaker open for API: {Message}. Allowing processing.",
+                    ex.Message);
+                return true; // Fail open when circuit is open
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex,
-                    "Error checking idempotency for {TaskId}. Allowing processing.",
-                    taskId);
-
-                return true; // Fail open
+                _logger.LogWarning(ex, "Error checking idempotency. Allowing processing.");
+                return true;
             }
         }
 
@@ -300,10 +321,15 @@ namespace DistributedProcessor.Worker.Services
         {
             try
             {
-                await _httpClient.PostAsync(
-                    $"api/idempotency/complete/{taskId}",
-                    null,
-                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+                await _apiCircuitBreaker.ExecuteAsync(async () =>
+                    await _httpClient.PostAsync(
+                        $"api/idempotency/complete/{taskId}",
+                        null,
+                        new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token));
+            }
+            catch (CircuitBreakerOpenException)
+            {
+                _logger.LogWarning("Circuit breaker open - skipping idempotency completion for {TaskId}", taskId);
             }
             catch (Exception ex)
             {
@@ -315,10 +341,15 @@ namespace DistributedProcessor.Worker.Services
         {
             try
             {
-                await _httpClient.PostAsync(
-                    $"api/idempotency/failed/{taskId}",
-                    null,
-                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+                await _apiCircuitBreaker.ExecuteAsync(async () =>
+                    await _httpClient.PostAsync(
+                        $"api/idempotency/failed/{taskId}",
+                        null,
+                        new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token));
+            }
+            catch (CircuitBreakerOpenException)
+            {
+                _logger.LogWarning("Circuit breaker open - skipping idempotency failed mark for {TaskId}", taskId);
             }
             catch (Exception ex)
             {
@@ -328,10 +359,11 @@ namespace DistributedProcessor.Worker.Services
 
         private async Task ProcessTaskAsync(ProcessingTask task, CancellationToken stoppingToken)
         {
-            // Update to Processing status
-            await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
+            // Update status with circuit breaker
+            await _apiCircuitBreaker.ExecuteAsync(async () =>
+                await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken));
 
-            // Process the task
+            // Process the task (your existing logic)
             var calculatedRows = new List<CalculatedRow>();
             decimal previousValue = 0;
             decimal cumulativeReturns = 0;
@@ -362,15 +394,16 @@ namespace DistributedProcessor.Worker.Services
                 _workerId, task.TaskId);
             await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
-            // Update to Processed status
-            await UpdateTaskStatusAsync(
-                task.TaskId,
-                "Processed",
-                _workerId,
-                stoppingToken,
-                calculatedRows.Count);
+            // Update to Processed with circuit breaker
+            await _apiCircuitBreaker.ExecuteAsync(async () =>
+                await UpdateTaskStatusAsync(
+                    task.TaskId,
+                    "Processed",
+                    _workerId,
+                    stoppingToken,
+                    calculatedRows.Count));
 
-            // Create and publish result
+            // Create result
             var result = new ProcessingResult
             {
                 TaskId = task.TaskId,
@@ -389,7 +422,9 @@ namespace DistributedProcessor.Worker.Services
                 Value = JsonSerializer.Serialize(result)
             };
 
-            await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
+            // Publish with circuit breaker
+            await _kafkaCircuitBreaker.ExecuteAsync(async () =>
+                await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken));
 
             _logger.LogInformation(
                 "Result published to {Topic} for task {TaskId}",
@@ -420,62 +455,45 @@ namespace DistributedProcessor.Worker.Services
                 TaskCanceledException tce when !tce.CancellationToken.IsCancellationRequested => true,
                 IOException => true,
                 SocketException => true,
-                SqlException sqlEx => IsTransientSqlError(sqlEx),
+                CircuitBreakerOpenException => true,
                 _ => false
             };
-        }
-
-        private bool IsTransientSqlError(SqlException sqlEx)
-        {
-            // Common transient SQL error codes
-            int[] transientErrorNumbers = {
-            -2,     // Timeout
-            -1,     // Connection broken
-            2,      // Network error
-            53,     // Connection broken
-            64,     // Connection lost
-            233,    // Connection init error
-            10053,  // Transport-level error
-            10054,  // Connection forcibly closed
-            10060,  // Network timeout
-            40197,  // Service error
-            40501,  // Service busy
-            40613,  // Database unavailable
-            49918,  // Cannot process request
-            49919,  // Cannot process create/update
-            49920   // Cannot process request
-        };
-
-            return transientErrorNumbers.Contains(sqlEx.Number);
         }
 
         private async Task SendToDlqAsync(ProcessingTask task, Exception exception, int retryCount)
         {
             try
             {
-                var dlqRequest = new
+                await _apiCircuitBreaker.ExecuteAsync(async () =>
                 {
-                    message = task,
-                    topic = TaskTopic,
-                    errorMessage = exception.Message,
-                    exceptionType = exception.GetType().Name,
-                    retryCount = retryCount,
-                    workerId = _workerId,
-                    jobId = task.JobId,
-                    taskId = task.TaskId
-                };
+                    var dlqRequest = new
+                    {
+                        message = task,
+                        topic = TaskTopic,
+                        errorMessage = exception.Message,
+                        exceptionType = exception.GetType().Name,
+                        retryCount = retryCount,
+                        workerId = _workerId,
+                        jobId = task.JobId,
+                        taskId = task.TaskId
+                    };
 
-                var response = await _httpClient.PostAsJsonAsync(
-                    "api/deadletter/send",
-                    dlqRequest,
-                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+                    var response = await _httpClient.PostAsJsonAsync(
+                        "api/deadletter/send",
+                        dlqRequest,
+                        new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError(
-                        "Failed to send to DLQ: {StatusCode} - {TaskId}",
-                        response.StatusCode, task.TaskId);
-                }
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        _logger.LogError(
+                            "Failed to send to DLQ: {StatusCode} - {TaskId}",
+                            response.StatusCode, task.TaskId);
+                    }
+                });
+            }
+            catch (CircuitBreakerOpenException)
+            {
+                _logger.LogError("Circuit breaker open - DLQ send failed for {TaskId}", task.TaskId);
             }
             catch (Exception ex)
             {
@@ -486,11 +504,11 @@ namespace DistributedProcessor.Worker.Services
         private async Task UpdateTaskStatusAsync(
             string taskId,
             string status,
-            string workerId = null,
+            string? workerId = null,
             CancellationToken stoppingToken = default,
             int rowCount = 0,
             long durationMs = 0,
-            string errorMessage = null)
+            string? errorMessage = null)
         {
             try
             {
@@ -504,20 +522,26 @@ namespace DistributedProcessor.Worker.Services
                     errorMessage = errorMessage
                 };
 
-                var response = await _httpClient.PutAsJsonAsync($"/api/task/update-status", updateData, stoppingToken);
+                var response = await _httpClient.PutAsJsonAsync(
+                    "api/task/update-status",
+                    updateData,
+                    stoppingToken);
 
                 if (response.IsSuccessStatusCode)
                 {
-                    _logger.LogDebug($"Task {taskId} status updated to {status}");
+                    _logger.LogDebug("Task {TaskId} status updated to {Status}", taskId, status);
                 }
                 else
                 {
-                    _logger.LogWarning($"Failed to update task {taskId} status: {response.StatusCode}");
+                    _logger.LogWarning(
+                        "Failed to update task {TaskId} status: {StatusCode}",
+                        taskId, response.StatusCode);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, $"Failed to update task {taskId} status to {status}");
+                _logger.LogWarning(ex, "Failed to update task {TaskId} status to {Status}", taskId, status);
+                throw; // Re-throw for circuit breaker to handle
             }
         }
 

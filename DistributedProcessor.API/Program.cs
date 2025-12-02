@@ -2,6 +2,7 @@ using DistributedProcessor.API.Hubs;
 using DistributedProcessor.API.Services;
 using DistributedProcessor.Data;
 using DistributedProcessor.Data.Services;
+using DistributedProcessor.Shared.Services;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 
@@ -34,6 +35,7 @@ builder.Services.AddSingleton<ICollectorHealthService, CollectorHealthService>()
 builder.Services.AddScoped<IDeadLetterService, DeadLetterService>();
 builder.Services.AddScoped<IIdempotencyService, IdempotencyService>();
 builder.Services.AddHostedService<IdempotencyCleanupService>();
+builder.Services.AddSingleton<ICircuitBreakerFactory, CircuitBreakerFactory>();
 
 builder.Services.AddCors(options =>
 {
