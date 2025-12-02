@@ -10,8 +10,10 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml;
 using Confluent.Kafka;
 using DistributedProcessor.Shared.Models;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -104,186 +106,55 @@ namespace DistributedProcessor.Worker.Services
                 _logger.LogWarning(ex, "Failed to initialize performance counters, using fallback");
             }
         }
-
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _taskConsumer.Subscribe(TaskTopic);
-            _logger.LogInformation($"Worker {_workerId} subscribed to {TaskTopic}");
+            _logger.LogInformation("Worker {WorkerId} subscribed to {Topic}", _workerId, TaskTopic);
 
-            // Start background heartbeat task with 1-second interval
             var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(stoppingToken), stoppingToken);
 
             try
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    ConsumeResult<string, string> consumeResult = null;
-                    ProcessingTask task = null;
-                    Stopwatch taskStopwatch = null;
+                    ConsumeResult<string, string>? consumeResult = null;
+                    ProcessingTask? task = null;
 
                     try
                     {
-                        consumeResult = _taskConsumer.Consume(stoppingToken);
+                        consumeResult = _taskConsumer.Consume(TimeSpan.FromMilliseconds(100));
 
                         if (consumeResult == null || consumeResult.IsPartitionEOF)
-                        {
                             continue;
-                        }
 
                         task = JsonSerializer.Deserialize<ProcessingTask>(consumeResult.Message.Value);
 
                         if (task == null)
                         {
                             _logger.LogWarning("Received null task, skipping");
-                            _taskConsumer.Commit(consumeResult); //  Commit even if null
+                            _taskConsumer.Commit(consumeResult);
                             continue;
                         }
 
-                        // IMMEDIATE STATUS UPDATE: Task starting
                         Interlocked.Increment(ref _activeTasks);
                         await SendImmediateHeartbeatAsync(stoppingToken);
 
-                        taskStopwatch = Stopwatch.StartNew();
+                        // Process with retry logic
+                        var success = await ProcessTaskWithRetryAsync(task, consumeResult, stoppingToken);
 
-                        _logger.LogInformation(
-                            $"Worker {_workerId} processing task {task.TaskId} from partition {consumeResult.Partition.Value} " +
-                            $"({task.Fund}/{task.Symbol}, {task.Rows.Count} rows)");
-
-                        // Update to Processing status
-                        await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
-
-                        // Process the task
-                        var calculatedRows = new List<CalculatedRow>();
-                        decimal previousValue = 0;
-                        decimal cumulativeReturns = 0;
-
-                        foreach (var row in task.Rows.OrderBy(r => r.Date))
+                        if (success)
                         {
-                            decimal returns = 0;
-                            if (previousValue > 0)
-                            {
-                                returns = (row.Value - previousValue) / previousValue;
-                                cumulativeReturns = (1 + cumulativeReturns) * (1 + returns) - 1;
-                            }
-
-                            var calculated = new CalculatedRow
-                            {
-                                Date = row.Date,
-                                Price = row.Value,
-                                Returns = returns,
-                                CumulativeReturns = cumulativeReturns
-                            };
-
-                            calculatedRows.Add(calculated);
-                            previousValue = row.Value;
+                            Interlocked.Increment(ref _totalProcessed);
                         }
-
-                        _logger.LogInformation($"Worker {_workerId} simulating 5-second processing delay for task {task.TaskId}");
-                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-
-                        taskStopwatch.Stop();
-
-                        // Update to Processed status (worker finished, before sending to Kafka)
-                        await UpdateTaskStatusAsync(
-                            task.TaskId,
-                            "Processed",
-                            _workerId,
-                            stoppingToken,
-                            calculatedRows.Count,
-                            taskStopwatch.ElapsedMilliseconds);
-
-                        // Create and publish result
-                        var result = new ProcessingResult
-                        {
-                            TaskId = task.TaskId,
-                            JobId = task.JobId,
-                            WorkerId = _workerId,
-                            Fund = task.Fund,
-                            Symbol = task.Symbol,
-                            CalculatedRows = calculatedRows,
-                            ProcessedAt = DateTime.UtcNow,
-                            Success = true,
-                            ProcessingDurationMs = taskStopwatch.ElapsedMilliseconds
-                        };
-
-                        var message = new Message<string, string>
-                        {
-                            Key = task.JobId,
-                            Value = JsonSerializer.Serialize(result)
-                        };
-
-                        //  CRITICAL: Publish result to Kafka
-                        var deliveryResult = await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
-
-                        _logger.LogInformation(
-                            $"Result published to {ResultTopic} at offset {deliveryResult.Offset} for task {task.TaskId}");
-
-                        //  CRITICAL: Commit ONLY after successful publish
-                        _taskConsumer.Commit(consumeResult);
-
-                        _logger.LogInformation($"Task {task.TaskId} committed to Kafka (offset {consumeResult.Offset})");
-
-                        Interlocked.Increment(ref _totalProcessed);
-
-                        _logger.LogInformation(
-                            $"Worker {_workerId} completed task {task.TaskId} in {taskStopwatch.ElapsedMilliseconds}ms " +
-                            $"({calculatedRows.Count} rows)");
                     }
                     catch (ConsumeException cex)
                     {
-                        _logger.LogError(cex, $"Kafka consume error: {cex.Error.Reason}");
-                        // Don't commit on consume error - let Kafka retry
+                        _logger.LogError(cex, "Kafka consume error: {Reason}", cex.Error.Reason);
                     }
                     catch (OperationCanceledException)
                     {
                         _logger.LogInformation("Worker shutting down gracefully");
                         break;
-                    }
-                    catch (Exception taskEx)
-                    {
-                        taskStopwatch?.Stop();
-                        _logger.LogError(taskEx, "Error processing task {TaskId}", task?.TaskId);
-
-                        if (task != null && consumeResult != null)
-                        {
-                            try
-                            {
-                                // Get retry count from headers
-                                int retryCount = GetRetryCount(consumeResult.Message.Headers);
-
-                                if (retryCount < MAX_RETRIES && IsTransientError(taskEx))
-                                {
-                                    // Transient error - don't commit, let Kafka retry
-                                    _logger.LogWarning(
-                                        "Transient error for task {TaskId}, attempt {Retry}/{Max}. Will retry.",
-                                        task.TaskId, retryCount + 1, MAX_RETRIES);
-
-                                    // Wait before next retry
-                                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryCount + 1)));
-                                    continue; // Don't commit, Kafka will redeliver
-                                }
-
-                                // Max retries reached or permanent error - send to DLQ
-                                await SendToDlqAsync(task, taskEx, retryCount);
-
-                                // Update task status to Failed
-                                await UpdateTaskStatusAsync(
-                                    task.TaskId,
-                                    "Failed",
-                                    _workerId,
-                                    stoppingToken,
-                                    0,
-                                    taskStopwatch?.ElapsedMilliseconds ?? 0,
-                                    $"Sent to DLQ: {taskEx.Message}");
-
-                                // Commit to prevent reprocessing
-                                _taskConsumer.Commit(consumeResult);
-                            }
-                            catch (Exception commitEx)
-                            {
-                                _logger.LogError(commitEx, "Failed to handle task failure for {TaskId}", task.TaskId);
-                            }
-                        }
                     }
                     finally
                     {
@@ -295,30 +166,172 @@ namespace DistributedProcessor.Worker.Services
             }
             finally
             {
-                _logger.LogInformation($"Worker {_workerId} shutting down, flushing producer...");
-                _resultProducer.Flush(TimeSpan.FromSeconds(10)); //  Ensure all messages sent
+                _logger.LogInformation("Worker {WorkerId} shutting down, flushing producer...", _workerId);
+                _resultProducer.Flush(TimeSpan.FromSeconds(10));
                 _taskConsumer.Close();
                 _resultProducer.Dispose();
-                _logger.LogInformation($"Worker {_workerId} stopped");
+                _logger.LogInformation("Worker {WorkerId} stopped", _workerId);
             }
         }
 
-        private int GetRetryCount(Headers? headers)
+        private async Task<bool> ProcessTaskWithRetryAsync(
+            ProcessingTask task,
+            ConsumeResult<string, string> consumeResult,
+            CancellationToken stoppingToken)
         {
-            if (headers == null) return 0;
+            Exception? lastException = null;
+            int retryCount = 0;
+            var taskStopwatch = Stopwatch.StartNew();
 
-            try
+            while (retryCount <= MAX_RETRIES)
             {
-                var header = headers.FirstOrDefault(h => h.Key == "retry-count");
-                if (header != null)
+                try
                 {
-                    var value = Encoding.UTF8.GetString(header.GetValueBytes());
-                    return int.TryParse(value, out var count) ? count : 0;
+                    _logger.LogInformation(
+                        "Worker {WorkerId} processing task {TaskId} (Attempt {Attempt}/{MaxAttempts})",
+                        _workerId, task.TaskId, retryCount + 1, MAX_RETRIES + 1);
+
+                    // Attempt to process the task
+                    await ProcessTaskAsync(task, stoppingToken);
+
+                    // Success - commit and return
+                    _taskConsumer.Commit(consumeResult);
+                    taskStopwatch.Stop();
+
+                    _logger.LogInformation(
+                        "Worker {WorkerId} completed task {TaskId} in {Duration}ms after {Attempts} attempt(s)",
+                        _workerId, task.TaskId, taskStopwatch.ElapsedMilliseconds, retryCount + 1);
+
+                    return true;
+                }
+                catch (Exception ex) when (IsTransientError(ex) && retryCount < MAX_RETRIES)
+                {
+                    lastException = ex;
+                    retryCount++;
+
+                    // Calculate exponential backoff with jitter
+                    var delay = CalculateBackoffDelay(retryCount);
+
+                    _logger.LogWarning(
+                        "Transient error processing task {TaskId}, retry {Retry}/{MaxRetry} after {Delay}ms. Error: {Error}",
+                        task.TaskId, retryCount, MAX_RETRIES, delay.TotalMilliseconds, ex.Message);
+
+                    await Task.Delay(delay, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    // Non-transient error or max retries exceeded
+                    lastException = ex;
+                    break;
                 }
             }
-            catch { }
 
-            return 0;
+            // All retries failed - send to DLQ
+            taskStopwatch.Stop();
+
+            _logger.LogError(lastException,
+                "Task {TaskId} failed after {Retries} retries. Total time: {Duration}ms. Sending to DLQ.",
+                task.TaskId, retryCount, taskStopwatch.ElapsedMilliseconds);
+
+            await SendToDlqAsync(task, lastException!, retryCount);
+            await UpdateTaskStatusAsync(
+                task.TaskId,
+                "Failed",
+                _workerId,
+                stoppingToken,
+                0,
+                taskStopwatch.ElapsedMilliseconds,
+                $"Failed after {retryCount} retries: {lastException?.Message}");
+
+            // Commit to prevent infinite reprocessing
+            _taskConsumer.Commit(consumeResult);
+
+            return false;
+        }
+
+        private async Task ProcessTaskAsync(ProcessingTask task, CancellationToken stoppingToken)
+        {
+            // Update to Processing status
+            await UpdateTaskStatusAsync(task.TaskId, "Processing", _workerId, stoppingToken);
+
+            // Process the task
+            var calculatedRows = new List<CalculatedRow>();
+            decimal previousValue = 0;
+            decimal cumulativeReturns = 0;
+
+            foreach (var row in task.Rows.OrderBy(r => r.Date))
+            {
+                decimal returns = 0;
+                if (previousValue != 0)
+                {
+                    returns = (row.Value - previousValue) / previousValue;
+                }
+                cumulativeReturns = (1 + cumulativeReturns) * (1 + returns) - 1;
+
+                var calculated = new CalculatedRow
+                {
+                    Date = row.Date,
+                    Price = row.Value,
+                    Returns = returns,
+                    CumulativeReturns = cumulativeReturns
+                };
+                calculatedRows.Add(calculated);
+
+                previousValue = row.Value;
+            }
+
+            _logger.LogInformation(
+                "Worker {WorkerId} simulating 5-second processing delay for task {TaskId}",
+                _workerId, task.TaskId);
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+
+            // Update to Processed status
+            await UpdateTaskStatusAsync(
+                task.TaskId,
+                "Processed",
+                _workerId,
+                stoppingToken,
+                calculatedRows.Count);
+
+            // Create and publish result
+            var result = new ProcessingResult
+            {
+                TaskId = task.TaskId,
+                JobId = task.JobId,
+                WorkerId = _workerId,
+                Fund = task.Fund,
+                Symbol = task.Symbol,
+                CalculatedRows = calculatedRows,
+                ProcessedAt = DateTime.UtcNow,
+                Success = true
+            };
+
+            var message = new Message<string, string>
+            {
+                Key = task.JobId,
+                Value = JsonSerializer.Serialize(result)
+            };
+
+            await _resultProducer.ProduceAsync(ResultTopic, message, stoppingToken);
+
+            _logger.LogInformation(
+                "Result published to {Topic} for task {TaskId}",
+                ResultTopic, task.TaskId);
+        }
+
+        private TimeSpan CalculateBackoffDelay(int retryCount)
+        {
+            // Exponential backoff: delay = baseDelay * 2^(retryCount-1)
+            var exponentialDelay = BASE_DELAY_MS * Math.Pow(2, retryCount - 1);
+
+            // Cap the delay at maximum
+            var cappedDelay = Math.Min(exponentialDelay, MAX_DELAY_MS);
+
+            // Add jitter (±20% randomness) to prevent thundering herd
+            var jitterFactor = 0.8 + (Random.Shared.NextDouble() * 0.4); // 0.8 to 1.2
+            var finalDelay = cappedDelay * jitterFactor;
+
+            return TimeSpan.FromMilliseconds(finalDelay);
         }
 
         private bool IsTransientError(Exception ex)
@@ -327,10 +340,36 @@ namespace DistributedProcessor.Worker.Services
             {
                 HttpRequestException => true,
                 TimeoutException => true,
+                TaskCanceledException tce when !tce.CancellationToken.IsCancellationRequested => true,
                 IOException => true,
                 SocketException => true,
+                SqlException sqlEx => IsTransientSqlError(sqlEx),
                 _ => false
             };
+        }
+
+        private bool IsTransientSqlError(SqlException sqlEx)
+        {
+            // Common transient SQL error codes
+            int[] transientErrorNumbers = {
+            -2,     // Timeout
+            -1,     // Connection broken
+            2,      // Network error
+            53,     // Connection broken
+            64,     // Connection lost
+            233,    // Connection init error
+            10053,  // Transport-level error
+            10054,  // Connection forcibly closed
+            10060,  // Network timeout
+            40197,  // Service error
+            40501,  // Service busy
+            40613,  // Database unavailable
+            49918,  // Cannot process request
+            49919,  // Cannot process create/update
+            49920   // Cannot process request
+        };
+
+            return transientErrorNumbers.Contains(sqlEx.Number);
         }
 
         private async Task SendToDlqAsync(ProcessingTask task, Exception exception, int retryCount)
@@ -351,11 +390,14 @@ namespace DistributedProcessor.Worker.Services
 
                 var response = await _httpClient.PostAsJsonAsync(
                     "api/deadletter/send",
-                    dlqRequest);
+                    dlqRequest,
+                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    _logger.LogError("Failed to send to DLQ: {StatusCode}", response.StatusCode);
+                    _logger.LogError(
+                        "Failed to send to DLQ: {StatusCode} - {TaskId}",
+                        response.StatusCode, task.TaskId);
                 }
             }
             catch (Exception ex)
