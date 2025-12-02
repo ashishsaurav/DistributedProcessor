@@ -175,10 +175,24 @@ namespace DistributedProcessor.Worker.Services
         }
 
         private async Task<bool> ProcessTaskWithRetryAsync(
-            ProcessingTask task,
-            ConsumeResult<string, string> consumeResult,
-            CancellationToken stoppingToken)
+        ProcessingTask task,
+        ConsumeResult<string, string> consumeResult,
+        CancellationToken stoppingToken)
         {
+            // CHECK IDEMPOTENCY FIRST
+            var canProcess = await CheckIdempotencyAsync(task.TaskId);
+
+            if (!canProcess)
+            {
+                _logger.LogInformation(
+                    "Task {TaskId} already processed or currently processing. Skipping.",
+                    task.TaskId);
+
+                // Already processed - commit to move forward
+                _taskConsumer.Commit(consumeResult);
+                return true;
+            }
+
             Exception? lastException = null;
             int retryCount = 0;
             var taskStopwatch = Stopwatch.StartNew();
@@ -191,10 +205,11 @@ namespace DistributedProcessor.Worker.Services
                         "Worker {WorkerId} processing task {TaskId} (Attempt {Attempt}/{MaxAttempts})",
                         _workerId, task.TaskId, retryCount + 1, MAX_RETRIES + 1);
 
-                    // Attempt to process the task
                     await ProcessTaskAsync(task, stoppingToken);
 
-                    // Success - commit and return
+                    // MARK AS COMPLETED
+                    await MarkIdempotencyCompletedAsync(task.TaskId);
+
                     _taskConsumer.Commit(consumeResult);
                     taskStopwatch.Stop();
 
@@ -209,7 +224,6 @@ namespace DistributedProcessor.Worker.Services
                     lastException = ex;
                     retryCount++;
 
-                    // Calculate exponential backoff with jitter
                     var delay = CalculateBackoffDelay(retryCount);
 
                     _logger.LogWarning(
@@ -220,18 +234,20 @@ namespace DistributedProcessor.Worker.Services
                 }
                 catch (Exception ex)
                 {
-                    // Non-transient error or max retries exceeded
                     lastException = ex;
                     break;
                 }
             }
 
-            // All retries failed - send to DLQ
+            // All retries failed
             taskStopwatch.Stop();
 
             _logger.LogError(lastException,
                 "Task {TaskId} failed after {Retries} retries. Total time: {Duration}ms. Sending to DLQ.",
                 task.TaskId, retryCount, taskStopwatch.ElapsedMilliseconds);
+
+            // MARK AS FAILED
+            await MarkIdempotencyFailedAsync(task.TaskId);
 
             await SendToDlqAsync(task, lastException!, retryCount);
             await UpdateTaskStatusAsync(
@@ -243,10 +259,71 @@ namespace DistributedProcessor.Worker.Services
                 taskStopwatch.ElapsedMilliseconds,
                 $"Failed after {retryCount} retries: {lastException?.Message}");
 
-            // Commit to prevent infinite reprocessing
             _taskConsumer.Commit(consumeResult);
 
             return false;
+        }
+
+        // ADD THESE HELPER METHODS:
+
+        private async Task<bool> CheckIdempotencyAsync(string taskId)
+        {
+            try
+            {
+                var response = await _httpClient.GetAsync(
+                    $"api/idempotency/can-process/{taskId}?workerId={_workerId}",
+                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var result = await response.Content.ReadFromJsonAsync<IdempotencyCheckResult>();
+                    return result?.CanProcess ?? true;
+                }
+
+                _logger.LogWarning(
+                    "Failed to check idempotency for {TaskId}: {StatusCode}. Allowing processing.",
+                    taskId, response.StatusCode);
+
+                return true; // Fail open
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Error checking idempotency for {TaskId}. Allowing processing.",
+                    taskId);
+
+                return true; // Fail open
+            }
+        }
+
+        private async Task MarkIdempotencyCompletedAsync(string taskId)
+        {
+            try
+            {
+                await _httpClient.PostAsync(
+                    $"api/idempotency/complete/{taskId}",
+                    null,
+                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to mark idempotency completed for {TaskId}", taskId);
+            }
+        }
+
+        private async Task MarkIdempotencyFailedAsync(string taskId)
+        {
+            try
+            {
+                await _httpClient.PostAsync(
+                    $"api/idempotency/failed/{taskId}",
+                    null,
+                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to mark idempotency failed for {TaskId}", taskId);
+            }
         }
 
         private async Task ProcessTaskAsync(ProcessingTask task, CancellationToken stoppingToken)
@@ -574,5 +651,9 @@ namespace DistributedProcessor.Worker.Services
             _httpClient?.Dispose();
             base.Dispose();
         }
+    }
+    internal class IdempotencyCheckResult
+    {
+        public bool CanProcess { get; set; }
     }
 }

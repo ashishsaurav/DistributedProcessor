@@ -16,6 +16,7 @@ namespace DistributedProcessor.Data
         public DbSet<JobExecution> JobExecutions { get; set; }
         public DbSet<TaskLog> TaskLogs { get; set; }
         public DbSet<DeadLetterMessage> DeadLetterMessages { get; set; }
+        public DbSet<IdempotencyKey> IdempotencyKeys { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -89,6 +90,17 @@ namespace DistributedProcessor.Data
                 entity.HasIndex(e => e.MessageId);
                 entity.HasIndex(e => e.Status);
                 entity.HasIndex(e => e.JobId);
+            });
+
+            modelBuilder.Entity<IdempotencyKey>(entity =>
+            {
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.TaskId).IsUnique();
+                entity.HasIndex(e => e.ExpiresAt);
+
+                entity.Property(e => e.TaskId).IsRequired().HasMaxLength(450);
+                entity.Property(e => e.Status).IsRequired().HasMaxLength(50);
+                entity.Property(e => e.WorkerId).HasMaxLength(255);
             });
         }
     }
