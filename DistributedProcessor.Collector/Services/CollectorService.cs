@@ -23,6 +23,13 @@ namespace DistributedProcessor.Collector.Services
         private readonly IConsumer<string, string> _consumer;
         private readonly HttpClient _httpClient;
         private readonly string _collectorId;
+
+        // Graceful shutdown fields
+        private readonly CancellationTokenSource _shutdownCts = new();
+        private volatile bool _isShuttingDown = false;
+        private readonly TimeSpan _shutdownTimeout = TimeSpan.FromSeconds(30);
+        private readonly SemaphoreSlim _shutdownLock = new(1, 1);
+
         private int _activeCollections = 0;
         private int _totalCollected = 0;
         private long _totalCollectionTimeMs = 0;
@@ -57,7 +64,7 @@ namespace DistributedProcessor.Collector.Services
             _httpClient = new HttpClient
             {
                 BaseAddress = new Uri(configuration["ApiUrl"] ?? "http://localhost:5000"),
-                Timeout = TimeSpan.FromSeconds(5)
+                Timeout = TimeSpan.FromSeconds(10)
             };
 
             InitializePerformanceCounters();
@@ -82,142 +89,182 @@ namespace DistributedProcessor.Collector.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _consumer.Subscribe("processing-results");
-            _logger.LogInformation($"Collector {_collectorId} subscribed to processing-results topic");
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                stoppingToken, _shutdownCts.Token);
+            var cancellationToken = linkedCts.Token;
 
-            // Start background heartbeat task
-            var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(stoppingToken), stoppingToken);
+            _consumer.Subscribe("processing-results");
+            _logger.LogInformation("Collector {CollectorId} started", _collectorId);
+
+            var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(cancellationToken));
 
             try
             {
-                while (!stoppingToken.IsCancellationRequested)
+                while (!cancellationToken.IsCancellationRequested && !_isShuttingDown)
                 {
-                    ConsumeResult<string, string> consumeResult = null;
-                    ProcessingResult result = null;
-                    Stopwatch collectionStopwatch = null;
+                    ConsumeResult<string, string>? consumeResult = null;
 
                     try
                     {
-                        consumeResult = _consumer.Consume(stoppingToken);
+                        consumeResult = _consumer.Consume(TimeSpan.FromMilliseconds(100));
 
                         if (consumeResult?.Message?.Value == null)
-                        {
-                            _logger.LogWarning("Received null message");
                             continue;
+
+                        // Check shutdown before accepting new collection
+                        if (_isShuttingDown)
+                        {
+                            _logger.LogInformation(
+                                "Shutdown in progress, not accepting new result");
+                            break;
                         }
 
-                        _logger.LogInformation($"Consumed message at offset {consumeResult.Offset}");
-
-                        result = JsonSerializer.Deserialize<ProcessingResult>(consumeResult.Message.Value);
+                        var result = JsonSerializer.Deserialize<ProcessingResult>(
+                            consumeResult.Message.Value);
 
                         if (result == null)
                         {
-                            _logger.LogWarning("Deserialized ProcessingResult is null");
-                            _consumer.Commit(consumeResult); //  Commit even if null
+                            _consumer.Commit(consumeResult);
                             continue;
                         }
 
-                        // Increment active collections
                         Interlocked.Increment(ref _activeCollections);
-                        await SendImmediateHeartbeatAsync(stoppingToken);
 
-                        // Simulate collection delay for testing
-                        _logger.LogInformation(
-                            $"Collector {_collectorId} simulating 5-second delay before saving TaskId: {result.TaskId}");
-                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                        // Process collection
+                        await ProcessCollectionAsync(result, consumeResult, cancellationToken);
 
-                        collectionStopwatch = Stopwatch.StartNew();
-
-                        using var scope = _scopeFactory.CreateScope();
-                        var dbService = scope.ServiceProvider.GetRequiredService<IDbService>();
-
-                        _logger.LogInformation($"Saving results for TaskId: {result.TaskId}");
-
-                        //  CRITICAL: Save to database
-                        await dbService.SaveCalculatedResultsAsync(result);
-
-                        collectionStopwatch.Stop();
-
-                        // Update task status to "Collected"
-                        await UpdateTaskStatusAsync(
-                            result.TaskId,
-                            "Collected",
-                            result.WorkerId,
-                            collectionStopwatch.ElapsedMilliseconds,
-                            stoppingToken);
-
-                        _logger.LogInformation(
-                            $"Results saved and collected for TaskId: {result.TaskId} in {collectionStopwatch.ElapsedMilliseconds}ms");
-
-                        //  CRITICAL: Commit ONLY after successful database save
-                        _consumer.Commit(consumeResult);
-
-                        _logger.LogInformation($" Collection committed to Kafka (offset {consumeResult.Offset})");
-
-                        // Update metrics
                         Interlocked.Increment(ref _totalCollected);
-                        Interlocked.Add(ref _totalCollectionTimeMs, collectionStopwatch.ElapsedMilliseconds);
                     }
                     catch (ConsumeException cex)
                     {
-                        _logger.LogError(cex, $"Kafka consume error: {cex.Error.Reason}");
-                        //  Don't commit on consume error
+                        _logger.LogError(cex, "Kafka consume error: {Reason}", cex.Error.Reason);
                     }
                     catch (OperationCanceledException)
                     {
-                        _logger.LogInformation("CollectorService stopping gracefully");
+                        _logger.LogInformation("Collector operation cancelled");
                         break;
-                    }
-                    catch (Exception ex)
-                    {
-                        collectionStopwatch?.Stop();
-                        _logger.LogError(ex, $"Error collecting results for task {result?.TaskId}");
-
-                        if (result != null && consumeResult != null)
-                        {
-                            try
-                            {
-                                // Mark task as failed collection
-                                await UpdateTaskStatusAsync(
-                                    result.TaskId,
-                                    "Failed",
-                                    result.WorkerId,
-                                    collectionStopwatch?.ElapsedMilliseconds ?? 0,
-                                    stoppingToken);
-
-                                //  Commit to prevent infinite retry
-                                _consumer.Commit(consumeResult);
-
-                                _logger.LogWarning($"Failed collection for {result.TaskId} committed to prevent reprocessing");
-                            }
-                            catch (Exception commitEx)
-                            {
-                                _logger.LogError(commitEx, $"Failed to handle collection error for {result?.TaskId}");
-                                //  Don't commit - collection will be retried
-                            }
-                        }
                     }
                     finally
                     {
-                        // Decrement active collections
-                        Interlocked.Decrement(ref _activeCollections);
-                        await SendImmediateHeartbeatAsync(stoppingToken);
+                        if (_activeCollections > 0)
+                            Interlocked.Decrement(ref _activeCollections);
                     }
                 }
             }
             finally
             {
-                _logger.LogInformation("Closing Kafka consumer");
+                await ShutdownGracefullyAsync();
+            }
+        }
+
+        private async Task ProcessCollectionAsync(
+        ProcessingResult result,
+        ConsumeResult<string, string> consumeResult,
+        CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var dbService = scope.ServiceProvider.GetRequiredService<IDbService>();
+
+                _logger.LogInformation("Saving results for TaskId {TaskId}", result.TaskId);
+
+                await dbService.SaveCalculatedResultsAsync(result);
+
+                await UpdateTaskStatusAsync(result.TaskId, "Collected", cancellationToken);
+
+                _consumer.Commit(consumeResult);
+
+                _logger.LogInformation("Collection completed for TaskId {TaskId}", result.TaskId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error collecting results for task {TaskId}", result.TaskId);
+
+                await UpdateTaskStatusAsync(result.TaskId, "Failed", cancellationToken);
+
+                _consumer.Commit(consumeResult); // Commit to prevent retry
+            }
+        }
+
+        private async Task ShutdownGracefullyAsync()
+        {
+            await _shutdownLock.WaitAsync();
+            try
+            {
+                if (_isShuttingDown) return;
+                _isShuttingDown = true;
+
+                _logger.LogInformation(
+                    "Collector {CollectorId} initiating graceful shutdown. Active: {Count}",
+                    _collectorId, _activeCollections);
+
+                // Unsubscribe
+                _consumer.Unsubscribe();
+
+                // Wait for active collections
+                var sw = Stopwatch.StartNew();
+                while (_activeCollections > 0 && sw.Elapsed < _shutdownTimeout)
+                {
+                    _logger.LogInformation(
+                        "Waiting for {Count} collection(s)... ({Elapsed:F0}s)",
+                        _activeCollections, sw.Elapsed.TotalSeconds);
+                    await Task.Delay(1000);
+                }
+
+                // Commit final offsets
+                try
+                {
+                    _consumer.Commit();
+                    _logger.LogInformation("Final offsets committed");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error committing final offsets");
+                }
+
+                // Send offline heartbeat
+                await SendOfflineHeartbeatAsync();
+
+                // Close consumer
                 _consumer.Close();
+
+                _logger.LogInformation(
+                    "Collector {CollectorId} shutdown complete. Total: {Total}",
+                    _collectorId, _totalCollected);
+            }
+            finally
+            {
+                _shutdownLock.Release();
+            }
+        }
+
+        private async Task SendOfflineHeartbeatAsync()
+        {
+            try
+            {
+                var status = new
+                {
+                    collectorId = _collectorId,
+                    state = "Offline",
+                    activeCollections = 0,
+                    totalCollected = _totalCollected,
+                    lastHeartbeat = DateTime.UtcNow
+                };
+
+                await _httpClient.PostAsJsonAsync("api/collector-health/update", status);
+                _logger.LogInformation("Sent offline heartbeat");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send offline heartbeat");
             }
         }
 
         private async Task UpdateTaskStatusAsync(
-            string taskId,
-            string status,
-            string workerId,
-            long durationMs,
-            CancellationToken stoppingToken)
+        string taskId,
+        string status,
+        CancellationToken cancellationToken)
         {
             try
             {
@@ -225,27 +272,57 @@ namespace DistributedProcessor.Collector.Services
                 {
                     taskId = taskId,
                     status = status,
-                    workerId = workerId,
-                    rowCount = 0,
-                    durationMs = durationMs,
-                    errorMessage = (string)null
+                    workerId = _collectorId
                 };
 
-                var response = await _httpClient.PutAsJsonAsync($"/api/task/update-status", updateData, stoppingToken);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    _logger.LogDebug($"Task {taskId} status updated to {status}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Failed to update task {taskId} status: {response.StatusCode}");
-                }
+                await _httpClient.PutAsJsonAsync("api/task/update-status", updateData, cancellationToken);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, $"Failed to update task {taskId} status to {status}");
+                _logger.LogWarning(ex, "Failed to update task status");
             }
+        }
+
+        private async Task SendHeartbeatsAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested && !_isShuttingDown)
+            {
+                try
+                {
+                    var status = new
+                    {
+                        collectorId = _collectorId,
+                        state = _activeCollections > 0 ? "Collecting" : "Idle",
+                        activeCollections = _activeCollections,
+                        totalCollected = _totalCollected,
+                        lastHeartbeat = DateTime.UtcNow
+                    };
+
+                    await _httpClient.PostAsJsonAsync("api/collector-health/update", status);
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to send heartbeat");
+                }
+            }
+        }
+
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("StopAsync called for collector {CollectorId}", _collectorId);
+            _isShuttingDown = true;
+            _shutdownCts.Cancel();
+            await base.StopAsync(cancellationToken);
+        }
+
+        public override void Dispose()
+        {
+            _shutdownCts?.Dispose();
+            _shutdownLock?.Dispose();
+            _consumer?.Dispose();
+            _httpClient?.Dispose();
+            base.Dispose();
         }
 
         // NEW: Send immediate heartbeat on collection state change
@@ -274,43 +351,6 @@ namespace DistributedProcessor.Collector.Services
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Failed to send immediate heartbeat");
-            }
-        }
-
-        private async Task SendHeartbeatsAsync(CancellationToken stoppingToken)
-        {
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                try
-                {
-                    string currentState = _activeCollections > 0 ? "Collecting" : "Idle";
-                    long avgCollectionTime = _totalCollected > 0 ? _totalCollectionTimeMs / _totalCollected : 0;
-
-                    var status = new CollectorStatus
-                    {
-                        CollectorId = _collectorId,
-                        State = currentState,
-                        ActiveCollections = _activeCollections,
-                        CpuUsage = GetCpuUsage(),
-                        MemoryUsageMB = GetMemoryUsage(),
-                        LastHeartbeat = DateTime.UtcNow,
-                        TotalCollected = _totalCollected,
-                        AvgCollectionTimeMs = avgCollectionTime
-                    };
-
-                    var response = await _httpClient.PostAsJsonAsync("/api/collector-health/update", status, stoppingToken);
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        _logger.LogDebug($"Heartbeat: State={currentState}, Collections={_activeCollections}, Total={_totalCollected}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to send heartbeat");
-                }
-
-                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
             }
         }
 

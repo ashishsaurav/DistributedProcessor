@@ -28,8 +28,14 @@ namespace DistributedProcessor.Worker.Services
         private readonly IProducer<string, string> _resultProducer;
         private readonly HttpClient _httpClient;
         private readonly string _workerId;
+
         private int _activeTasks = 0;
         private int _totalProcessed = 0;
+
+        private readonly CancellationTokenSource _shutdownCts = new();
+        private volatile bool _isShuttingDown = false;
+        private readonly TimeSpan _shutdownTimeout = TimeSpan.FromSeconds(30);
+        private readonly SemaphoreSlim _shutdownLock = new(1, 1);
 
         // Circuit Breakers
         private readonly ICircuitBreaker _apiCircuitBreaker;
@@ -96,7 +102,7 @@ namespace DistributedProcessor.Worker.Services
             _httpClient = new HttpClient
             {
                 BaseAddress = new Uri(configuration["ApiUrl"] ?? "http://localhost:5000"),
-                Timeout = TimeSpan.FromSeconds(5)
+                Timeout = TimeSpan.FromSeconds(10)
             };
 
             InitializePerformanceCounters();
@@ -128,24 +134,41 @@ namespace DistributedProcessor.Worker.Services
         }
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _taskConsumer.Subscribe(TaskTopic);
-            _logger.LogInformation("Worker {WorkerId} subscribed to {Topic}", _workerId, TaskTopic);
+            // Link cancellation tokens
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                stoppingToken, _shutdownCts.Token);
+            var cancellationToken = linkedCts.Token;
 
-            var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(stoppingToken), stoppingToken);
+            _taskConsumer.Subscribe(TaskTopic);
+            _logger.LogInformation("Worker {WorkerId} started and subscribed to {Topic}",
+                _workerId, TaskTopic);
+
+            // Start heartbeat task
+            var heartbeatTask = Task.Run(() => SendHeartbeatsAsync(cancellationToken));
 
             try
             {
-                while (!stoppingToken.IsCancellationRequested)
+                while (!cancellationToken.IsCancellationRequested && !_isShuttingDown)
                 {
                     ConsumeResult<string, string>? consumeResult = null;
                     ProcessingTask? task = null;
 
                     try
                     {
+                        // Use short timeout to check shutdown flag frequently
                         consumeResult = _taskConsumer.Consume(TimeSpan.FromMilliseconds(100));
 
                         if (consumeResult == null || consumeResult.IsPartitionEOF)
                             continue;
+
+                        // Check shutdown before accepting new task
+                        if (_isShuttingDown)
+                        {
+                            _logger.LogInformation(
+                                "Shutdown in progress, not accepting new task from offset {Offset}",
+                                consumeResult.Offset);
+                            break; // Stop accepting new tasks
+                        }
 
                         task = JsonSerializer.Deserialize<ProcessingTask>(consumeResult.Message.Value);
 
@@ -157,10 +180,10 @@ namespace DistributedProcessor.Worker.Services
                         }
 
                         Interlocked.Increment(ref _activeTasks);
-                        await SendImmediateHeartbeatAsync(stoppingToken);
+                        await SendImmediateHeartbeatAsync(cancellationToken);
 
                         // Process with retry logic
-                        var success = await ProcessTaskWithRetryAsync(task, consumeResult, stoppingToken);
+                        var success = await ProcessTaskWithRetryAsync(task, consumeResult, cancellationToken);
 
                         if (success)
                         {
@@ -173,25 +196,171 @@ namespace DistributedProcessor.Worker.Services
                     }
                     catch (OperationCanceledException)
                     {
-                        _logger.LogInformation("Worker shutting down gracefully");
+                        _logger.LogInformation("Worker operation cancelled, initiating graceful shutdown");
                         break;
                     }
                     finally
                     {
                         if (_activeTasks > 0)
                             Interlocked.Decrement(ref _activeTasks);
-                        await SendImmediateHeartbeatAsync(stoppingToken);
+                        await SendImmediateHeartbeatAsync(cancellationToken);
                     }
                 }
             }
             finally
             {
-                _logger.LogInformation("Worker {WorkerId} shutting down, flushing producer...", _workerId);
-                _resultProducer.Flush(TimeSpan.FromSeconds(10));
-                _taskConsumer.Close();
-                _resultProducer.Dispose();
-                _logger.LogInformation("Worker {WorkerId} stopped", _workerId);
+                await ShutdownGracefullyAsync();
             }
+        }
+
+        private async Task ShutdownGracefullyAsync()
+        {
+            await _shutdownLock.WaitAsync();
+            try
+            {
+                if (_isShuttingDown) return; // Already shutting down
+                _isShuttingDown = true;
+
+                _logger.LogInformation(
+                    "Worker {WorkerId} initiating graceful shutdown. Active tasks: {Count}",
+                    _workerId, _activeTasks);
+
+                // STEP 1: Unsubscribe from Kafka (stop receiving new messages)
+                try
+                {
+                    _taskConsumer.Unsubscribe();
+                    _logger.LogInformation("Unsubscribed from Kafka topic");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error unsubscribing from Kafka");
+                }
+
+                // STEP 2: Wait for active tasks to complete (with timeout)
+                var sw = Stopwatch.StartNew();
+                while (_activeTasks > 0 && sw.Elapsed < _shutdownTimeout)
+                {
+                    _logger.LogInformation(
+                        "Waiting for {Count} active task(s) to complete... ({Elapsed:F0}s elapsed)",
+                        _activeTasks, sw.Elapsed.TotalSeconds);
+
+                    await Task.Delay(TimeSpan.FromSeconds(1));
+                }
+
+                if (_activeTasks > 0)
+                {
+                    _logger.LogWarning(
+                        "Shutdown timeout reached with {Count} task(s) still pending. " +
+                        "These tasks will be reprocessed by another worker.",
+                        _activeTasks);
+                }
+                else
+                {
+                    _logger.LogInformation("All active tasks completed successfully");
+                }
+
+                // STEP 3: Flush Kafka producer (ensure all results are sent)
+                _logger.LogInformation("Flushing Kafka producer...");
+                try
+                {
+                    var remainingMessages = _resultProducer.Flush(TimeSpan.FromSeconds(10));
+                    if (remainingMessages > 0)
+                    {
+                        _logger.LogWarning(
+                            "{Count} message(s) could not be flushed from producer",
+                            remainingMessages);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Kafka producer flushed successfully");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error flushing Kafka producer");
+                }
+
+                // STEP 4: Commit final offsets
+                try
+                {
+                    var committed = _taskConsumer.Commit();
+                    _logger.LogInformation(
+                        "Final offset commit: {Offsets}",
+                        string.Join(", ", committed.Select(c =>
+                            $"{c.Topic}[{c.Partition}]@{c.Offset}")));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error committing final offsets");
+                }
+
+                // STEP 5: Send offline heartbeat
+                await SendOfflineHeartbeatAsync();
+
+                // STEP 6: Close Kafka consumer
+                try
+                {
+                    _taskConsumer.Close();
+                    _logger.LogInformation("Kafka consumer closed");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error closing Kafka consumer");
+                }
+
+                // STEP 7: Dispose resources
+                _resultProducer?.Dispose();
+                _httpClient?.Dispose();
+
+                _logger.LogInformation(
+                    "Worker {WorkerId} graceful shutdown completed. " +
+                    "Total processed: {TotalProcessed}",
+                    _workerId, _totalProcessed);
+            }
+            finally
+            {
+                _shutdownLock.Release();
+            }
+        }
+
+        private async Task SendOfflineHeartbeatAsync()
+        {
+            try
+            {
+                var status = new
+                {
+                    workerId = _workerId,
+                    state = "Offline",
+                    activeTasks = 0,
+                    cpuUsage = 0.0,
+                    memoryUsageMB = 0.0,
+                    lastHeartbeat = DateTime.UtcNow,
+                    totalProcessed = _totalProcessed
+                };
+
+                await _httpClient.PostAsJsonAsync(
+                    "api/health/update",
+                    status,
+                    new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+
+                _logger.LogInformation("Sent offline heartbeat to API");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send offline heartbeat");
+            }
+        }
+
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("StopAsync called for worker {WorkerId}", _workerId);
+
+            // Trigger graceful shutdown
+            _isShuttingDown = true;
+            _shutdownCts.Cancel();
+
+            // Call base implementation
+            await base.StopAsync(cancellationToken);
         }
 
         private async Task<bool> ProcessTaskWithRetryAsync(
@@ -545,26 +714,28 @@ namespace DistributedProcessor.Worker.Services
             }
         }
 
-        // NEW: Send immediate heartbeat on task state change
         private async Task SendImmediateHeartbeatAsync(CancellationToken stoppingToken)
         {
+            if (_isShuttingDown) return; // Don't send heartbeats during shutdown
+
             try
             {
                 string currentState = _activeTasks > 0 ? "Busy" : "Idle";
 
-                var status = new WorkerStatus
+                var status = new
                 {
-                    WorkerId = _workerId,
-                    State = currentState,
-                    ActiveTasks = _activeTasks,
-                    CpuUsage = GetCpuUsage(),
-                    MemoryUsageMB = GetMemoryUsage(),
-                    LastHeartbeat = DateTime.UtcNow,
-                    TotalProcessed = _totalProcessed
+                    workerId = _workerId,
+                    state = currentState,
+                    activeTasks = _activeTasks,
+                    cpuUsage = 0.0, // Can be calculated if needed
+                    memoryUsageMB = 0.0,
+                    lastHeartbeat = DateTime.UtcNow,
+                    totalProcessed = _totalProcessed
                 };
 
-                await _httpClient.PostAsJsonAsync("/api/health/update", status, stoppingToken);
-                _logger.LogDebug($"Immediate heartbeat: State={currentState}, Tasks={_activeTasks}");
+                await _httpClient.PostAsJsonAsync("api/health/update", status, stoppingToken);
+                _logger.LogDebug("Immediate heartbeat: State={State}, Tasks={Tasks}",
+                    currentState, _activeTasks);
             }
             catch (Exception ex)
             {
@@ -574,38 +745,22 @@ namespace DistributedProcessor.Worker.Services
 
         private async Task SendHeartbeatsAsync(CancellationToken stoppingToken)
         {
-            while (!stoppingToken.IsCancellationRequested)
+            while (!stoppingToken.IsCancellationRequested && !_isShuttingDown)
             {
                 try
                 {
-                    string currentState = _activeTasks > 0 ? "Busy" : "Idle";
-
-                    var status = new WorkerStatus
-                    {
-                        WorkerId = _workerId,
-                        State = currentState,
-                        ActiveTasks = _activeTasks,
-                        CpuUsage = GetCpuUsage(),
-                        MemoryUsageMB = GetMemoryUsage(),
-                        LastHeartbeat = DateTime.UtcNow,
-                        TotalProcessed = _totalProcessed
-                    };
-
-                    var response = await _httpClient.PostAsJsonAsync("/api/health/update", status, stoppingToken);
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        _logger.LogDebug(
-                            $"Heartbeat: State={currentState}, Tasks={_activeTasks}, " +
-                            $"CPU={status.CpuUsage:F1}%, Mem={status.MemoryUsageMB:F0}MB");
-                    }
+                    await SendImmediateHeartbeatAsync(stoppingToken);
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to send heartbeat");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
                 }
-
-                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
             }
         }
 
@@ -669,7 +824,8 @@ namespace DistributedProcessor.Worker.Services
 
         public override void Dispose()
         {
-            _cpuCounter?.Dispose();
+            _shutdownCts?.Dispose();
+            _shutdownLock?.Dispose();
             _taskConsumer?.Dispose();
             _resultProducer?.Dispose();
             _httpClient?.Dispose();
